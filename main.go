@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -35,6 +36,11 @@ type VirusTotalResult struct {
 // freeTierDelay is the delay between API requests when -free is set (VirusTotal free API: 4 req/min).
 const freeTierDelay = 15 * time.Second
 
+var skipDirs = map[string]bool{
+	".git": true, "node_modules": true, "__pycache__": true,
+	"vendor": true, ".venv": true, ".idea": true, ".vscode": true,
+}
+
 func main() {
 	freeMode := flag.Bool("free", false, "use free-tier rate limiting (4 requests/min)")
 	output := flag.String("o", "text", "output format: text or json")
@@ -42,6 +48,7 @@ func main() {
 	noCache := flag.Bool("no-cache", false, "disable cache (don't read or write)")
 	refresh := flag.Bool("refresh", false, "ignore cached results but still write new ones")
 	cacheAge := flag.Int("cache-age", 7, "maximum age of cached results in days")
+	recursive := flag.Bool("r", false, "recursively scan subdirectories")
 	flag.Parse()
 	switch *output {
 	case "text", "json":
@@ -121,34 +128,48 @@ func main() {
 	}
 
 	if fi.IsDir() {
-		entries, err := os.ReadDir(arg)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
-		}
 		var scanned, malicious int
 		firstFile := true
-		for _, entry := range entries {
-			if entry.IsDir() || !entry.Type().IsRegular() {
-				continue
+
+		err := filepath.WalkDir(arg, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", path, err)
+				return nil
 			}
+
+			if d.IsDir() {
+				if path != arg {
+					if skipDirs[d.Name()] {
+						return fs.SkipDir
+					}
+					if !*recursive {
+						return fs.SkipDir
+					}
+				}
+				return nil
+			}
+
+			if !d.Type().IsRegular() {
+				return nil
+			}
+
+			// Everything below here is your existing loop body — copy it in
 			if *freeMode && !firstFile {
 				time.Sleep(freeTierDelay)
 			}
 			firstFile = false
-			fullPath := filepath.Join(arg, entry.Name())
-			hash, err := hashFile(fullPath)
+			hash, err := hashFile(path)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "Error:", fullPath, err)
-				continue
+				fmt.Fprintln(os.Stderr, "Error:", path, err)
+				return nil
 			}
 			if *output == "text" {
-				fmt.Println(color.HiBlueString("--- %s ---", fullPath))
+				fmt.Println(color.HiBlueString("--- %s ---", path))
 			}
-			result, err := lookupAndPrint(client, apiKey, *output, fullPath, hash, cache, *refresh, *cacheAge)
+			result, err := lookupAndPrint(client, apiKey, *output, path, hash, cache, *refresh, *cacheAge)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "Error:", err)
-				continue
+				return nil
 			}
 			if result.Found {
 				scanned++
@@ -156,7 +177,15 @@ func main() {
 					malicious++
 				}
 			}
+			return nil
+		})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
 		}
+
+		// Summary printing — same as before
+
 		if *output == "json" {
 			if err := printJSONSummary(arg, scanned, malicious); err != nil {
 				fmt.Fprintln(os.Stderr, "Error:", err)
@@ -169,6 +198,7 @@ func main() {
 			}
 			fmt.Printf("Scanned %d files, %s malicious\n", scanned, maliciousStr)
 		}
+
 		if malicious > 0 {
 			flushCache()
 			os.Exit(2)

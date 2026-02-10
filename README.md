@@ -7,10 +7,11 @@ A command-line tool that computes SHA-256 hashes of files and checks them agains
 - **SHA-256 hashing** — streams files through `crypto/sha256` so even large files are hashed without loading them entirely into memory.
 - **VirusTotal lookup** — queries the VirusTotal v3 API and reports malicious/suspicious/undetected/harmless engine counts, reputation score, and threat classification.
 - **Direct hash lookup** — pass a 64-character hex string instead of a file path to look up a hash you already have.
-- **Directory scanning** — point it at a directory to scan all regular files (symlinks and subdirectories are skipped).
+- **Directory scanning** — point it at a directory to scan all regular files (symlinks are skipped). Use `-r` for recursive scanning with automatic skipping of common non-essential directories (`.git`, `node_modules`, `__pycache__`, `vendor`, etc.).
 - **Free-tier rate limiting** — the `-free` flag enforces a 15-second delay between API calls to stay within VirusTotal's free API limit (4 requests/minute).
 - **Colored output** — malicious results in red, suspicious in yellow, clean in green. Disable with `-no-color` or the `NO_COLOR` environment variable.
 - **JSON output** — use `-o json` for NDJSON (one JSON object per line), suitable for piping into `jq` or other tools.
+- **Result caching** — caches VirusTotal results locally (`~/.cache/hashchecker/results.json`) to avoid redundant API calls. Cached results expire after 7 days by default. Control with `--no-cache`, `--refresh`, and `--cache-age`.
 - **Scriptable exit codes** — exit 0 for clean, 1 for errors, 2 when malicious files are detected.
 
 ## Prerequisites
@@ -63,7 +64,7 @@ To persist, add this to your PowerShell profile (`$PROFILE`).
 ## Usage
 
 ```
-hashchecker [-free] [-o text|json] [-no-color] <file | SHA-256 hash | directory>
+hashchecker [-free] [-r] [-o text|json] [-no-color] [-no-cache] [-refresh] [-cache-age N] <file | SHA-256 hash | directory>
 ```
 
 ### Flags
@@ -71,8 +72,12 @@ hashchecker [-free] [-o text|json] [-no-color] <file | SHA-256 hash | directory>
 | Flag | Description |
 |------|-------------|
 | `-free` | Rate-limit API requests to 4/minute (VirusTotal free tier) |
+| `-r` | Recursively scan subdirectories (skips `.git`, `node_modules`, `__pycache__`, `vendor`, `.venv`, `.idea`, `.vscode`) |
 | `-o text\|json` | Output format. Default: `text`. Use `json` for NDJSON output |
 | `-no-color` | Disable colored terminal output |
+| `-no-cache` | Disable cache entirely (don't read or write) |
+| `-refresh` | Ignore cached results but still write new ones |
+| `-cache-age N` | Maximum age of cached results in days (default: 7) |
 
 ### Scan a single file
 
@@ -103,7 +108,15 @@ hashchecker 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
 hashchecker -free ~/Downloads
 ```
 
-Scans every regular file in the directory (non-recursive). With `-free`, requests are spaced 15 seconds apart.
+Scans every regular file in the directory (non-recursive by default). With `-free`, requests are spaced 15 seconds apart.
+
+### Recursive scan
+
+```bash
+hashchecker -r -free ~/projects
+```
+
+Walks the entire directory tree, automatically skipping `.git`, `node_modules`, `__pycache__`, `vendor`, and other non-essential directories.
 
 ### JSON output
 
@@ -160,12 +173,39 @@ Use it to verify hashchecker is working:
 hashchecker 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
 ```
 
+## Caching
+
+Results are cached locally to reduce API calls. The cache file is stored at:
+
+- **Linux:** `~/.cache/hashchecker/results.json`
+- **macOS:** `~/Library/Caches/hashchecker/results.json`
+- **Windows:** `%LocalAppData%\hashchecker\results.json`
+
+By default, cached results are valid for 7 days. To force a fresh lookup:
+
+```bash
+hashchecker --refresh 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
+```
+
+To disable caching entirely:
+
+```bash
+hashchecker --no-cache /path/to/file
+```
+
+To change the cache expiry (e.g., 1 day):
+
+```bash
+hashchecker -cache-age 1 /path/to/file
+```
+
 ## Security considerations
 
 - **API key handling** — the key is read from an environment variable, never from command-line flags (which are visible in `ps` output and shell history).
 - **Read-only** — hashchecker only reads files and makes GET requests. It never modifies files or uploads content.
 - **Symlink safety** — directory scans skip symlinks, preventing path traversal or infinite-read attacks (e.g., a symlink to `/dev/zero`).
 - **Input validation** — hash arguments are validated as valid hex before being used in API URLs.
+- **Cache permissions** — the cache directory is created with `0700` and the cache file with `0600` (owner-only access).
 
 ## License
 
