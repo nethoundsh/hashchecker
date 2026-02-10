@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -38,6 +39,9 @@ func main() {
 	freeMode := flag.Bool("free", false, "use free-tier rate limiting (4 requests/min)")
 	output := flag.String("o", "text", "output format: text or json")
 	noColor := flag.Bool("no-color", false, "disable colored output")
+	noCache := flag.Bool("no-cache", false, "disable cache (don't read or write)")
+	refresh := flag.Bool("refresh", false, "ignore cached results but still write new ones")
+	cacheAge := flag.Int("cache-age", 7, "maximum age of cached results in days")
 	flag.Parse()
 	switch *output {
 	case "text", "json":
@@ -56,6 +60,33 @@ func main() {
 		os.Exit(1)
 	}
 
+	var cache map[string]cacheEntry
+	var cachePath string
+	if !*noCache {
+		var err error
+		cachePath, err = getCacheFilePath()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Warning: cache disabled:", err)
+			cache = make(map[string]cacheEntry)
+		} else {
+			cache, err = loadCache(cachePath)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Warning: cache disabled:", err)
+			}
+		}
+	}
+	if cache == nil {
+		cache = make(map[string]cacheEntry)
+	}
+
+	flushCache := func() {
+		if !*noCache && cachePath != "" {
+			if err := saveCache(cachePath, cache); err != nil {
+				fmt.Fprintln(os.Stderr, "Warning: failed to save cache:", err)
+			}
+		}
+	}
+
 	// Create shared HTTP client once so connections can be reused.
 	client := &http.Client{Timeout: 15 * time.Second}
 
@@ -70,14 +101,16 @@ func main() {
 
 	if isHexHash(arg) {
 		hash := strings.ToLower(arg)
-		result, err := lookupAndPrint(client, apiKey, *output, "", hash)
+		result, err := lookupAndPrint(client, apiKey, *output, "", hash, cache, *refresh, *cacheAge)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
 		if result.Found && result.Malicious > 0 {
+			flushCache()
 			os.Exit(2)
 		}
+		flushCache()
 		return
 	}
 
@@ -112,7 +145,7 @@ func main() {
 			if *output == "text" {
 				fmt.Println(color.HiBlueString("--- %s ---", fullPath))
 			}
-			result, err := lookupAndPrint(client, apiKey, *output, fullPath, hash)
+			result, err := lookupAndPrint(client, apiKey, *output, fullPath, hash, cache, *refresh, *cacheAge)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "Error:", err)
 				continue
@@ -137,8 +170,10 @@ func main() {
 			fmt.Printf("Scanned %d files, %s malicious\n", scanned, maliciousStr)
 		}
 		if malicious > 0 {
+			flushCache()
 			os.Exit(2)
 		}
+		flushCache()
 		return
 	}
 
@@ -147,14 +182,17 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
-	result, err := lookupAndPrint(client, apiKey, *output, arg, hash)
+	result, err := lookupAndPrint(client, apiKey, *output, arg, hash, cache, *refresh, *cacheAge)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
 	if result.Found && result.Malicious > 0 {
+		flushCache()
 		os.Exit(2)
 	}
+
+	flushCache()
 }
 
 type jsonRecord struct {
@@ -173,12 +211,44 @@ type jsonSummaryRecord struct {
 	Summary jsonSummary `json:"summary"`
 }
 
+type cacheEntry struct {
+	Result    VirusTotalResult `json:"result"`
+	Timestamp time.Time        `json:"timestamp"`
+}
+
 // lookupAndPrint calls VirusTotal, prints the result (text or JSON), and returns it to the caller.
 // This keeps the lookup+presentation pattern in one place without over-abstracting.
-func lookupAndPrint(client *http.Client, apiKey, output, path, hash string) (VirusTotalResult, error) {
+func lookupAndPrint(client *http.Client, apiKey, output, path, hash string, cache map[string]cacheEntry, refresh bool,
+	cacheAgeDays int) (VirusTotalResult, error) {
+
+	// Check cache first
+	if !refresh {
+		if entry, ok := cache[hash]; ok {
+			age := time.Since(entry.Timestamp)
+			if age < time.Duration(cacheAgeDays)*24*time.Hour {
+				// Cache hit — use stored result, skip API call
+				// ... print result and return ...
+				switch output {
+				case "json":
+					if err := printJSON(path, hash, entry.Result); err != nil {
+						return VirusTotalResult{}, err
+					}
+				default:
+					printResult(hash, entry.Result)
+				}
+				return entry.Result, nil
+			}
+		}
+	}
 	result, err := checkVirusTotal(client, apiKey, hash)
+
 	if err != nil {
 		return VirusTotalResult{}, err
+	}
+
+	cache[hash] = cacheEntry{
+		Result:    result,
+		Timestamp: time.Now(),
 	}
 	switch output {
 	case "json":
@@ -373,4 +443,47 @@ func yellowOrGreenInt(n int) string {
 		return color.YellowString("%d", n)
 	}
 	return color.GreenString("%d", n)
+}
+
+// small helper function to get the cache file path
+func getCacheFilePath() (string, error) {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cacheDir, "hashchecker", "results.json"), nil
+}
+func loadCache(path string) (map[string]cacheEntry, error) {
+	cache := make(map[string]cacheEntry)
+	cacheFile, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return cache, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer cacheFile.Close()
+	if err := json.NewDecoder(cacheFile).Decode(&cache); err != nil {
+		fmt.Fprintln(os.Stderr, "Warning: corrupt cache file, starting fresh")
+		return make(map[string]cacheEntry), nil
+	}
+	return cache, nil
+}
+
+func saveCache(path string, cache map[string]cacheEntry) error {
+	// Step 1: create the parent directory if it doesn't exist
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+
+	// Step 2: serialize the cache map to JSON
+	jsonBytes, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return err
+	}
+	// Step 3: write the JSON bytes to the file
+	if err := os.WriteFile(path, jsonBytes, 0o600); err != nil {
+		return err
+	}
+	return nil
 }
