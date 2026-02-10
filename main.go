@@ -21,10 +21,10 @@ import (
 // Found is false when the hash is not in VirusTotal (e.g. 404); otherwise
 // the other fields are populated from the file report.
 type VirusTotalResult struct {
-	Found       bool   `json:"found"`        // true if VirusTotal has a report for this hash
-	Name        string `json:"name"`         // meaningful_name from the report
-	Reputation  int    `json:"reputation"`   // reputation score
-	Malicious   int    `json:"malicious"`    // number of engines that flagged as malicious
+	Found       bool   `json:"found"`      // true if VirusTotal has a report for this hash
+	Name        string `json:"name"`       // meaningful_name from the report
+	Reputation  int    `json:"reputation"` // reputation score
+	Malicious   int    `json:"malicious"`  // number of engines that flagged as malicious
 	Suspicious  int    `json:"suspicious"`
 	Undetected  int    `json:"undetected"`
 	Harmless    int    `json:"harmless"`
@@ -46,13 +46,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "invalid -o value; must be 'text' or 'json'")
 		os.Exit(1)
 	}
-	
+
 	if *output == "json" || *noColor {
 		color.NoColor = true
 	}
 
 	if flag.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: hashcheck [-free] [-o text|json] [-no-color] <file or SHA-256 hash or directory>")
+		fmt.Fprintln(os.Stderr, "Usage: hashchecker [-free] [-o text|json] [-no-color] <file or SHA-256 hash or directory>")
 		os.Exit(1)
 	}
 
@@ -307,8 +307,8 @@ func checkVirusTotal(client *http.Client, apiKey, hash string) (VirusTotalResult
 	var result struct {
 		Data struct {
 			Attributes struct {
-				MeaningfulName string `json:"meaningful_name"`
-				Reputation     int    `json:"reputation"`
+				MeaningfulName    string `json:"meaningful_name"`
+				Reputation        int    `json:"reputation"`
 				LastAnalysisStats struct {
 					Malicious  int `json:"malicious"`
 					Suspicious int `json:"suspicious"`

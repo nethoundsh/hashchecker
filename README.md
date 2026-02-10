@@ -1,4 +1,4 @@
-# hashcheck
+# hashchecker
 
 A command-line tool that computes SHA-256 hashes of files and checks them against the [VirusTotal](https://www.virustotal.com/) API. Scan a single file, look up a known hash, or sweep an entire directory — with colored terminal output and machine-readable JSON.
 
@@ -21,15 +21,15 @@ A command-line tool that computes SHA-256 hashes of files and checks them agains
 ## Installation
 
 ```bash
-git clone https://github.com/nethound/hashcheck.git
-cd hashcheck
-go build -o hashcheck .
+git clone https://github.com/nethoundsh/hashchecker.git
+cd hashchecker
+go build -o hashchecker .
 ```
 
 Or install directly:
 
 ```bash
-go install github.com/nethound/hashcheck@latest
+go install github.com/nethoundsh/hashchecker@latest
 ```
 
 ## Configuration
@@ -45,7 +45,7 @@ Add this to your `~/.bashrc`, `~/.zshrc`, or equivalent to persist it across ses
 ## Usage
 
 ```
-hashcheck [-free] [-o text|json] [-no-color] <file | SHA-256 hash | directory>
+hashchecker [-free] [-o text|json] [-no-color] <file | SHA-256 hash | directory>
 ```
 
 ### Flags
@@ -59,7 +59,7 @@ hashcheck [-free] [-o text|json] [-no-color] <file | SHA-256 hash | directory>
 ### Scan a single file
 
 ```bash
-hashcheck /path/to/suspicious-file.exe
+hashchecker /path/to/suspicious-file.exe
 ```
 
 ```
@@ -76,13 +76,13 @@ Threat:     trojan.generic/agent
 ### Look up a known hash
 
 ```bash
-hashcheck 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
+hashchecker 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
 ```
 
 ### Scan a directory
 
 ```bash
-hashcheck -free ~/Downloads
+hashchecker -free ~/Downloads
 ```
 
 Scans every regular file in the directory (non-recursive). With `-free`, requests are spaced 15 seconds apart.
@@ -90,7 +90,7 @@ Scans every regular file in the directory (non-recursive). With `-free`, request
 ### JSON output
 
 ```bash
-hashcheck -o json /path/to/file
+hashchecker -o json /path/to/file
 ```
 
 ```json
@@ -108,7 +108,7 @@ For directory scans, each file produces one JSON line followed by a summary line
 Pipe into `jq` for filtering:
 
 ```bash
-hashcheck -o json ~/Downloads | jq 'select(.result.malicious > 0)'
+hashchecker -o json ~/Downloads | jq 'select(.result.malicious > 0)'
 ```
 
 ## Exit codes
@@ -122,7 +122,7 @@ hashcheck -o json ~/Downloads | jq 'select(.result.malicious > 0)'
 Use in scripts:
 
 ```bash
-hashcheck /path/to/file
+hashchecker /path/to/file
 if [ $? -eq 2 ]; then
     echo "Malicious file detected!"
 fi
@@ -136,16 +136,16 @@ The [EICAR test file](https://www.eicar.org/download-anti-malware-testfile/) is 
 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
 ```
 
-Use it to verify hashcheck is working:
+Use it to verify hashchecker is working:
 
 ```bash
-hashcheck 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
+hashchecker 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
 ```
 
 ## Security considerations
 
 - **API key handling** — the key is read from an environment variable, never from command-line flags (which are visible in `ps` output and shell history).
-- **Read-only** — hashcheck only reads files and makes GET requests. It never modifies files or uploads content.
+- **Read-only** — hashchecker only reads files and makes GET requests. It never modifies files or uploads content.
 - **Symlink safety** — directory scans skip symlinks, preventing path traversal or infinite-read attacks (e.g., a symlink to `/dev/zero`).
 - **Input validation** — hash arguments are validated as valid hex before being used in API URLs.
 
