@@ -36,11 +36,29 @@ go install github.com/nethoundsh/hashchecker@latest
 
 Set your VirusTotal API key as an environment variable:
 
+**Linux/macOS:**
+
 ```bash
 export VIRUSTOTAL_API_KEY="your-api-key-here"
 ```
 
 Add this to your `~/.bashrc`, `~/.zshrc`, or equivalent to persist it across sessions.
+
+**Windows (Command Prompt):**
+
+```cmd
+set VIRUSTOTAL_API_KEY=your-api-key-here
+```
+
+To persist across sessions, use `setx` instead of `set`.
+
+**Windows (PowerShell):**
+
+```powershell
+$env:VIRUSTOTAL_API_KEY="your-api-key-here"
+```
+
+To persist, add this to your PowerShell profile (`$PROFILE`).
 
 ## Usage
 

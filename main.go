@@ -1,4 +1,4 @@
-// hashcheck hashes files and checks them against VirusTotal.
+// hashchecker hashes files and checks them against VirusTotal.
 package main
 
 import (
