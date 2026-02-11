@@ -14,7 +14,7 @@ func TestPrintJSON(t *testing.T) {
 			Found: true, Name: "test.exe", Malicious: 5, Harmless: 50,
 		}
 		stdout := captureStdout(t, func() {
-			if err := printJSON("/tmp/test.exe", "abc123", vt); err != nil {
+			if err := printJSON("/tmp/test.exe", "abc123", "sha256", vt); err != nil {
 				t.Fatalf("printJSON error: %v", err)
 			}
 		})
@@ -29,6 +29,9 @@ func TestPrintJSON(t *testing.T) {
 		if rec.Hash != "abc123" {
 			t.Fatalf("Hash = %q, want %q", rec.Hash, "abc123")
 		}
+		if rec.Algorithm != "sha256" {
+			t.Fatalf("Algorithm = %q, want %q", rec.Algorithm, "sha256")
+		}
 		if rec.Result.Malicious != 5 {
 			t.Fatalf("Result.Malicious = %d, want 5", rec.Result.Malicious)
 		}
@@ -37,7 +40,7 @@ func TestPrintJSON(t *testing.T) {
 	t.Run("without path omits field", func(t *testing.T) {
 		vt := VirusTotalResult{Found: true, Name: "raw.bin"}
 		stdout := captureStdout(t, func() {
-			if err := printJSON("", "def456", vt); err != nil {
+			if err := printJSON("", "def456", "md5", vt); err != nil {
 				t.Fatalf("printJSON error: %v", err)
 			}
 		})
@@ -45,6 +48,10 @@ func TestPrintJSON(t *testing.T) {
 		// The "path" key should be absent (omitempty)
 		if strings.Contains(stdout, `"path"`) {
 			t.Fatalf("expected path to be omitted, got: %s", stdout)
+		}
+		// Algorithm field should be present
+		if !strings.Contains(stdout, `"algorithm":"md5"`) {
+			t.Fatalf("expected algorithm field, got: %s", stdout)
 		}
 	})
 }
@@ -87,9 +94,9 @@ func TestPrintResult(t *testing.T) {
 			ThreatLabel: "trojan.generic",
 		}
 		stdout := captureStdout(t, func() {
-			printResult("abc123", vt)
+			printResult("abc123", "sha256", vt)
 		})
-		for _, want := range []string{"abc123", "malware.exe", "-5", "42", "trojan.generic"} {
+		for _, want := range []string{"abc123", "SHA-256", "malware.exe", "-5", "42", "trojan.generic"} {
 			if !strings.Contains(stdout, want) {
 				t.Errorf("output missing %q\ngot: %s", want, stdout)
 			}
@@ -99,10 +106,13 @@ func TestPrintResult(t *testing.T) {
 	t.Run("not found", func(t *testing.T) {
 		vt := VirusTotalResult{Found: false}
 		stdout := captureStdout(t, func() {
-			printResult("def456", vt)
+			printResult("def456", "sha1", vt)
 		})
 		if !strings.Contains(stdout, "Not found") {
 			t.Fatalf("expected 'Not found' message, got: %s", stdout)
+		}
+		if !strings.Contains(stdout, "SHA-1") {
+			t.Fatalf("expected 'SHA-1' label, got: %s", stdout)
 		}
 	})
 }

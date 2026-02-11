@@ -19,9 +19,10 @@ import (
 // when empty — this happens when the user passes a raw hash instead of
 // a file path, since there's no meaningful path to display.
 type jsonRecord struct {
-	Path   string           `json:"path,omitempty"` // file path (empty for raw hash lookups)
-	Hash   string           `json:"hash"`           // SHA-256 hash in hex
-	Result VirusTotalResult `json:"result"`         // full VT result
+	Path      string           `json:"path,omitempty"` // file path (empty for raw hash lookups)
+	Hash      string           `json:"hash"`           // hash in hex
+	Algorithm string           `json:"algorithm"`      // hash algorithm used (e.g. "sha256")
+	Result    VirusTotalResult `json:"result"`         // full VT result
 }
 
 // jsonSummary is the summary object emitted after scanning a directory.
@@ -46,11 +47,12 @@ type jsonSummaryRecord struct {
 //
 // json.Marshal serializes the struct into a []byte. We convert it to a
 // string for fmt.Println, which appends the newline that makes it NDJSON.
-func printJSON(path, hash string, vtResult VirusTotalResult) error {
+func printJSON(path, hash, algo string, vtResult VirusTotalResult) error {
 	rec := jsonRecord{
-		Path:   path,
-		Hash:   hash,
-		Result: vtResult,
+		Path:      path,
+		Hash:      hash,
+		Algorithm: algo,
+		Result:    vtResult,
 	}
 	b, err := json.Marshal(rec)
 	if err != nil {
@@ -83,14 +85,16 @@ func printJSONSummary(path string, scanned, found, malicious int) error {
 // printResult renders a human-readable, color-coded summary for a single
 // VirusTotal result.
 //
-// The "%-12s" format specifier left-aligns the label in a 12-character
-// wide column, which keeps the values neatly aligned:
+// The "%-16s" format specifier left-aligns the label in a 16-character
+// wide column, which keeps the values neatly aligned even with the
+// algorithm name in the hash label:
 //
-//	Hash:       abc123...
-//	Name:       malware.exe
-//	Reputation: -5
-func printResult(hash string, vtResult VirusTotalResult) {
-	fmt.Printf("%-12s%s\n", "Hash:", color.CyanString(hash))
+//	Hash (SHA-256): abc123...
+//	Name:           malware.exe
+//	Reputation:     -5
+func printResult(hash, algo string, vtResult VirusTotalResult) {
+	label := "Hash (" + algoLabel(algo) + "):"
+	fmt.Printf("%-16s%s\n", label, color.CyanString(hash))
 
 	// If VT doesn't recognize this hash, there's nothing else to show.
 	if !vtResult.Found {
@@ -98,12 +102,12 @@ func printResult(hash string, vtResult VirusTotalResult) {
 		return
 	}
 
-	fmt.Printf("%-12s%s\n", "Name:", vtResult.Name)
-	fmt.Printf("%-12s%s\n", "Reputation:", repColorInt(vtResult.Reputation))
-	fmt.Printf("%-12s%s\n", "Malicious:", redOrGreenInt(vtResult.Malicious))
-	fmt.Printf("%-12s%s\n", "Suspicious:", yellowOrGreenInt(vtResult.Suspicious))
-	fmt.Printf("%-12s%s\n", "Undetected:", yellowOrGreenInt(vtResult.Undetected))
-	fmt.Printf("%-12s%s\n", "Harmless:", color.GreenString("%d", vtResult.Harmless))
+	fmt.Printf("%-16s%s\n", "Name:", vtResult.Name)
+	fmt.Printf("%-16s%s\n", "Reputation:", repColorInt(vtResult.Reputation))
+	fmt.Printf("%-16s%s\n", "Malicious:", redOrGreenInt(vtResult.Malicious))
+	fmt.Printf("%-16s%s\n", "Suspicious:", yellowOrGreenInt(vtResult.Suspicious))
+	fmt.Printf("%-16s%s\n", "Undetected:", yellowOrGreenInt(vtResult.Undetected))
+	fmt.Printf("%-16s%s\n", "Harmless:", color.GreenString("%d", vtResult.Harmless))
 
 	// Threat label display logic:
 	// - No label at all → show "None" so the user knows it's intentionally blank
@@ -111,11 +115,28 @@ func printResult(hash string, vtResult VirusTotalResult) {
 	// - Not malicious but has a label → show it plain (informational, not alarming)
 	switch {
 	case vtResult.ThreatLabel == "":
-		fmt.Printf("%-12s%s\n", "Threat:", "None")
+		fmt.Printf("%-16s%s\n", "Threat:", "None")
 	case vtResult.Malicious > 0:
-		fmt.Printf("%-12s%s\n", "Threat:", color.RedString("%s", vtResult.ThreatLabel))
+		fmt.Printf("%-16s%s\n", "Threat:", color.RedString("%s", vtResult.ThreatLabel))
 	default:
-		fmt.Printf("%-12s%s\n", "Threat:", vtResult.ThreatLabel)
+		fmt.Printf("%-16s%s\n", "Threat:", vtResult.ThreatLabel)
+	}
+}
+
+// algoLabel returns the human-readable display name for a hash
+// algorithm identifier (e.g. "sha256" → "SHA-256"). This is used in
+// the text output label so users see "Hash (SHA-256):" instead of the
+// raw flag value.
+func algoLabel(algo string) string {
+	switch algo {
+	case "sha256":
+		return "SHA-256"
+	case "sha1":
+		return "SHA-1"
+	case "md5":
+		return "MD5"
+	default:
+		return algo
 	}
 }
 

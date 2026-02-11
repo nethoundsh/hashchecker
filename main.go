@@ -1,8 +1,9 @@
-// hashchecker is a CLI tool that computes SHA-256 hashes of files and looks
-// them up against the VirusTotal API to check for known malware.
+// hashchecker is a CLI tool that computes file hashes and looks them up
+// against the VirusTotal API to check for known malware. It supports
+// SHA-256 (default), SHA-1, and MD5 via the -algo flag.
 //
 // It supports three input modes:
-//   - A raw SHA-256 hash string (64 hex chars)
+//   - A raw hash string (64 hex chars for SHA-256, 40 for SHA-1, 32 for MD5)
 //   - A path to a single file
 //   - A path to a directory (scans all regular files, optionally recursive)
 //
@@ -12,10 +13,13 @@ package main
 
 import (
 	"context"       // context.Context for cancellation propagation
-	"crypto/sha256" // SHA-256 hashing for file fingerprints
+	"crypto/md5"    // MD5 hashing (16-byte digest)
+	"crypto/sha1"   // SHA-1 hashing (20-byte digest)
+	"crypto/sha256" // SHA-256 hashing (32-byte digest)
 	"encoding/hex"  // hex encode/decode — used for hash string conversion and validation
 	"flag"          // stdlib CLI flag parsing — simple and idiomatic for Go CLIs
 	"fmt"           // formatted I/O — Printf, Fprintln, etc.
+	"hash"          // hash.Hash interface — common type for all crypto hash functions
 	"io"            // io.Copy for streaming file content into the hasher without loading it all into memory
 	"io/fs"         // filesystem interfaces — fs.SkipDir for WalkDir control, DirEntry for file metadata
 	"net/http"      // HTTP client for VirusTotal API calls
@@ -81,13 +85,14 @@ func run() int {
 	refresh := flag.Bool("refresh", false, "ignore cached results but still write new ones")
 	cacheAge := flag.Int("cache-age", 7, "maximum age of cached results in days")
 	recursive := flag.Bool("r", false, "recursively scan subdirectories")
+	algo := flag.String("algo", "sha256", "hash algorithm: sha256, sha1, or md5")
 	showVersion := flag.Bool("version", false, "print version and exit")
 
 	// ── File Filter Flags ───────────────────────────────────────────
 	//
 	// These flags let you narrow which files get hashed and looked up.
 	// Filtering happens BEFORE hashing, so excluded files don't waste
-	// CPU on SHA-256 computation or API quota on VirusTotal lookups.
+	// CPU on hash computation or API quota on VirusTotal lookups.
 	//
 	// We use flag.String (not a custom flag.Value) for simplicity.
 	// Comma-separated values are split after parsing — this avoids
@@ -101,7 +106,7 @@ func run() int {
 	// are provided. flag.PrintDefaults() formats all registered flags
 	// with their types and default values.
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: hashchecker [flags] <file | SHA-256 hash | directory>\n\nFlags:\n")
+		fmt.Fprintf(os.Stderr, "Usage: hashchecker [flags] <file | hash | directory>\n\nFlags:\n")
 		flag.PrintDefaults()
 	}
 
@@ -225,6 +230,15 @@ func run() int {
 		return 1
 	}
 
+	// Validate the hash algorithm. Same whitelisting pattern.
+	switch *algo {
+	case "sha256", "sha1", "md5":
+		// ok — valid algorithm
+	default:
+		fmt.Fprintln(os.Stderr, "invalid -algo value; must be 'sha256', 'sha1', or 'md5'")
+		return 1
+	}
+
 	// Disable color when outputting JSON (so it can be parsed by other
 	// tools) or when the user explicitly requests no color.
 	// color.NoColor is a package-level variable from fatih/color that
@@ -267,8 +281,8 @@ func run() int {
 
 	// ── Cache Initialization ────────────────────────────────────────────
 	//
-	// The cache maps SHA-256 hashes to their VirusTotal results and a
-	// timestamp. This avoids redundant API calls for files that have
+	// The cache maps "algo:hash" keys to their VirusTotal results and
+	// a timestamp. This avoids redundant API calls for files that have
 	// already been checked recently.
 	//
 	// We declare the cache and its path here so they're available to
@@ -330,7 +344,7 @@ func run() int {
 		return 1
 	}
 
-	// The first positional argument — either a SHA-256 hash, a file
+	// The first positional argument — either a hex hash string, a file
 	// path, or a directory path.
 	arg := flag.Arg(0)
 
@@ -341,6 +355,7 @@ func run() int {
 		client:       client,
 		apiKey:       apiKey,
 		output:       *output,
+		algo:         *algo,
 		cache:        cache,
 		refresh:      *refresh,
 		cacheAgeDays: *cacheAge,
@@ -362,7 +377,7 @@ func run() int {
 		maxSizeStr: *maxSizeStr,
 	}
 
-	if isHexHash(arg) {
+	if isHexHash(arg, *algo) {
 		return runHash(arg, cfg)
 	}
 
@@ -383,7 +398,7 @@ func run() int {
 // branches in run(). They return an exit code: 0 = clean, 1 = error,
 // 2 = malicious file(s) found.
 
-// runHash handles the case where the user passes a raw SHA-256 hash
+// runHash handles the case where the user passes a raw hex hash
 // string. It normalizes the hash to lowercase, looks it up on
 // VirusTotal, and returns the appropriate exit code.
 func runHash(arg string, cfg lookupConfig) int {
@@ -440,7 +455,7 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig) int {
 			return nil
 		}
 
-		hash, err := hashFile(path)
+		hash, err := hashFile(path, cfg.algo)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", path, err)
 			return nil
@@ -512,7 +527,7 @@ func runFile(arg string, fi os.FileInfo, cfg lookupConfig, sc scanConfig) int {
 		}
 	}
 
-	hash, err := hashFile(arg)
+	hash, err := hashFile(arg, cfg.algo)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
@@ -530,23 +545,43 @@ func runFile(arg string, fi os.FileInfo, cfg lookupConfig, sc scanConfig) int {
 
 // ── Utility Functions ───────────────────────────────────────────────
 
-// isHexHash reports whether s looks like a valid SHA-256 hash string.
-// A SHA-256 hash is 32 bytes, which is 64 hex characters.
+// isHexHash reports whether s looks like a valid hex-encoded hash for
+// the given algorithm. Each algorithm has a fixed digest size:
+//   - SHA-256 = 32 bytes (64 hex chars)
+//   - SHA-1   = 20 bytes (40 hex chars)
+//   - MD5     = 16 bytes (32 hex chars)
 //
 // Rather than checking length and character set separately, we use
 // hex.DecodeString which validates both in one call — if the string
 // has an odd length or non-hex characters, it returns an error.
-// We then confirm the decoded length is exactly 32 bytes.
+// We then confirm the decoded length matches the expected digest size.
 //
 // Go naming convention: functions that return bool are often named
 // "isSomething" or "hasSomething" for readability at the call site.
-func isHexHash(s string) bool {
+func isHexHash(s, algo string) bool {
 	b, err := hex.DecodeString(s)
-	return err == nil && len(b) == 32
+	if err != nil {
+		return false
+	}
+	switch algo {
+	case "sha256":
+		return len(b) == 32
+	case "sha1":
+		return len(b) == 20
+	case "md5":
+		return len(b) == 16
+	default:
+		return false
+	}
 }
 
-// hashFile computes the SHA-256 hash of the file at filePath and returns
-// it as a lowercase hex string.
+// hashFile computes the hash of the file at filePath using the specified
+// algorithm and returns it as a lowercase hex string.
+//
+// Go idiom: hash.Hash is the standard interface that all crypto hash
+// functions (sha256, sha1, md5) implement. It also satisfies io.Writer,
+// so the same io.Copy streaming pattern works for any algorithm —
+// polymorphism through interfaces.
 //
 // Go idiom: defer file.Close() guarantees the file handle is released
 // when the function returns, regardless of whether we return normally
@@ -556,7 +591,7 @@ func isHexHash(s string) bool {
 // hash (an io.Writer) in chunks. This means we never load the entire
 // file into memory — critical for hashing large files without running
 // out of RAM.
-func hashFile(filePath string) (_ string, err error) {
+func hashFile(filePath, algo string) (_ string, err error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", fmt.Errorf("hashing: %w", err) // os.Open already includes the path
@@ -567,13 +602,24 @@ func hashFile(filePath string) (_ string, err error) {
 		}
 	}()
 
-	// sha256.New() returns a hash.Hash, which implements io.Writer.
-	// Each Write call updates the running hash. Sum(nil) finalizes it
-	// and returns the 32-byte digest.
-	hash := sha256.New()
-	_, err = io.Copy(hash, file)
+	// Select the hash function based on the algorithm flag. Each
+	// New() returns a hash.Hash, which implements io.Writer. Each
+	// Write call updates the running hash. Sum(nil) finalizes it
+	// and returns the digest bytes.
+	var h hash.Hash
+	switch algo {
+	case "sha256":
+		h = sha256.New()
+	case "sha1":
+		h = sha1.New()
+	case "md5":
+		h = md5.New()
+	default:
+		return "", fmt.Errorf("unsupported algorithm: %s", algo)
+	}
+	_, err = io.Copy(h, file)
 	if err != nil {
 		return "", fmt.Errorf("hashing %s: %w", filePath, err)
 	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

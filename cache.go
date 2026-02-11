@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -69,6 +70,19 @@ func loadCache(path string) (_ map[string]cacheEntry, err error) {
 		fmt.Fprintln(os.Stderr, "Warning: corrupt cache file, starting fresh")
 		return make(map[string]cacheEntry), nil
 	}
+
+	// Migrate legacy cache keys: older versions stored bare hashes as
+	// keys (e.g. "abc123"). The new format is "algo:hash" (e.g.
+	// "sha256:abc123"). All pre-existing entries are SHA-256, so we
+	// prepend "sha256:" to any key that doesn't already contain ":".
+	// This is a one-time, lossless migration.
+	for key, entry := range cache {
+		if !strings.Contains(key, ":") {
+			cache["sha256:"+key] = entry
+			delete(cache, key)
+		}
+	}
+
 	return cache, nil
 }
 

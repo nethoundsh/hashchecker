@@ -38,6 +38,7 @@ type lookupConfig struct {
 	client       *http.Client
 	apiKey       string
 	output       string
+	algo         string // hash algorithm: "sha256", "sha1", or "md5"
 	cache        map[string]cacheEntry
 	refresh      bool
 	cacheAgeDays int
@@ -63,21 +64,24 @@ type lookupConfig struct {
 func lookupAndPrint(path, hash string, cfg lookupConfig) (VirusTotalResult, error) {
 	// ── Cache Check ─────────────────────────────────────────────────
 	//
-	// Unless -refresh was passed, try to serve from cache. The
-	// "comma ok" idiom (entry, ok := cache[hash]) is how you check
-	// for map key existence in Go — ok is true if the key was found.
+	// Unless -refresh was passed, try to serve from cache. The cache
+	// key is "algo:hash" (e.g. "sha256:abc123") so results from
+	// different algorithms don't collide. The "comma ok" idiom
+	// (entry, ok := cache[key]) is how you check for map key
+	// existence in Go — ok is true if the key was found.
+	cacheKey := cfg.algo + ":" + hash
 	if !cfg.refresh {
-		if entry, ok := cfg.cache[hash]; ok {
+		if entry, ok := cfg.cache[cacheKey]; ok {
 			age := time.Since(entry.Timestamp)
 			if age < time.Duration(cfg.cacheAgeDays)*24*time.Hour {
 				// Cache hit — result is fresh enough, skip the API call.
 				switch cfg.output {
 				case "json":
-					if err := printJSON(path, hash, entry.Result); err != nil {
+					if err := printJSON(path, hash, cfg.algo, entry.Result); err != nil {
 						return VirusTotalResult{}, fmt.Errorf("formatting output: %w", err)
 					}
 				default:
-					printResult(hash, entry.Result)
+					printResult(hash, cfg.algo, entry.Result)
 				}
 				return entry.Result, nil
 			}
@@ -105,7 +109,7 @@ func lookupAndPrint(path, hash string, cfg lookupConfig) (VirusTotalResult, erro
 
 	// Store the fresh result in the in-memory cache. The cache is
 	// flushed to disk by the deferred flushCache() in run() on return.
-	cfg.cache[hash] = cacheEntry{
+	cfg.cache[cacheKey] = cacheEntry{
 		Result:    result,
 		Timestamp: time.Now(),
 	}
@@ -113,11 +117,11 @@ func lookupAndPrint(path, hash string, cfg lookupConfig) (VirusTotalResult, erro
 	// ── Output ──────────────────────────────────────────────────────
 	switch cfg.output {
 	case "json":
-		if err := printJSON(path, hash, result); err != nil {
+		if err := printJSON(path, hash, cfg.algo, result); err != nil {
 			return VirusTotalResult{}, fmt.Errorf("formatting output: %w", err)
 		}
 	default:
-		printResult(hash, result)
+		printResult(hash, cfg.algo, result)
 	}
 	return result, nil
 }
@@ -179,8 +183,8 @@ func parseRetryAfter(header string) time.Duration {
 }
 
 // checkVirusTotal queries the VirusTotal v3 API for a file report by
-// SHA-256 hash. It retries up to 3 times on HTTP 429 (rate limited),
-// using the Retry-After header to determine wait time.
+// hash (SHA-256, SHA-1, or MD5). It retries up to 3 times on HTTP 429
+// (rate limited), using the Retry-After header to determine wait time.
 //
 // Return behavior:
 //   - HTTP 404 → (VirusTotalResult{Found: false}, nil) — hash not in VT

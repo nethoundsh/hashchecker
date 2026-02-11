@@ -234,7 +234,7 @@ func TestLookupAndPrint(t *testing.T) {
 		{
 			name: "cache hit skips API",
 			cache: map[string]cacheEntry{
-				testHash: {
+				"sha256:" + testHash: {
 					Result: VirusTotalResult{
 						Found: true, Name: "from-cache.exe", Malicious: 3,
 					},
@@ -248,7 +248,7 @@ func TestLookupAndPrint(t *testing.T) {
 		{
 			name: "expired cache calls API",
 			cache: map[string]cacheEntry{
-				testHash: {
+				"sha256:" + testHash: {
 					Result: VirusTotalResult{
 						Found: true, Name: "old-cache.exe",
 					},
@@ -262,7 +262,7 @@ func TestLookupAndPrint(t *testing.T) {
 		{
 			name: "refresh bypasses cache",
 			cache: map[string]cacheEntry{
-				testHash: {
+				"sha256:" + testHash: {
 					Result:    VirusTotalResult{Found: true, Name: "cached.exe"},
 					Timestamp: time.Now(),
 				},
@@ -302,6 +302,7 @@ func TestLookupAndPrint(t *testing.T) {
 				client:       srv.Client(),
 				apiKey:       "test-key",
 				output:       outputMode,
+				algo:         "sha256",
 				cache:        tt.cache,
 				refresh:      tt.refresh,
 				cacheAgeDays: 7,

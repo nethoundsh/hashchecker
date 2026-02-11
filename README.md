@@ -1,12 +1,12 @@
 # hashchecker
 
-A command-line tool that computes SHA-256 hashes of files and checks them against the [VirusTotal](https://www.virustotal.com/) API. Scan a single file, look up a known hash, or sweep an entire directory — with colored terminal output, file filtering, and machine-readable JSON.
+A command-line tool that computes file hashes and checks them against the [VirusTotal](https://www.virustotal.com/) API. Supports SHA-256 (default), SHA-1, and MD5. Scan a single file, look up a known hash, or sweep an entire directory — with colored terminal output, file filtering, and machine-readable JSON.
 
 ## Features
 
-- **SHA-256 hashing** — streams files through `crypto/sha256` so even large files are hashed without loading them entirely into memory.
-- **VirusTotal lookup** — queries the VirusTotal v3 API and reports malicious/suspicious/undetected/harmless engine counts, reputation score, and threat classification.
-- **Direct hash lookup** — pass a 64-character hex string instead of a file path to look up a hash you already have.
+- **Multi-hash support** — SHA-256 (default), SHA-1, and MD5 via the `-algo` flag. Files are streamed through `hash.Hash` so even large files are hashed without loading them entirely into memory.
+- **VirusTotal lookup** — queries the VirusTotal v3 API and reports malicious/suspicious/undetected/harmless engine counts, reputation score, and threat classification. The API natively accepts SHA-256, SHA-1, and MD5 hashes.
+- **Direct hash lookup** — pass a hex hash string instead of a file path to look up a hash you already have (64 chars for SHA-256, 40 for SHA-1, 32 for MD5).
 - **Directory scanning** — point it at a directory to scan all regular files (symlinks are skipped). Use `-r` for recursive scanning with automatic skipping of common non-essential directories (`.git`, `node_modules`, `__pycache__`, `vendor`, etc.).
 - **File filtering** — narrow which files get scanned with glob patterns (`-include`, `-exclude`) and size limits (`-min-size`, `-max-size`). Filters are applied before hashing, so excluded files don't waste CPU or API quota.
 - **Rate limiting** — the `-free` flag enforces VirusTotal's free-tier limit (4 requests/minute), or use `-rate N` for custom pacing. Uses a token-bucket limiter with random jitter to avoid bot detection.
@@ -82,13 +82,14 @@ To persist, add this to your PowerShell profile (`$PROFILE`).
 ## Usage
 
 ```
-hashchecker [flags] <file | SHA-256 hash | directory>
+hashchecker [flags] <file | hash | directory>
 ```
 
 ### Flags
 
 | Flag | Description |
 |------|-------------|
+| `-algo sha256\|sha1\|md5` | Hash algorithm to use. Default: `sha256` |
 | `-free` | Rate-limit API requests to 4/minute (VirusTotal free tier) |
 | `-rate N` | Custom rate limit: max N API requests per minute (overrides `-free`) |
 | `-r` | Recursively scan subdirectories (skips `.git`, `node_modules`, `__pycache__`, `vendor`, `.venv`, `.idea`, `.vscode`) |
@@ -110,20 +111,33 @@ hashchecker /path/to/suspicious-file.exe
 ```
 
 ```
-Hash:       e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-Name:       suspicious-file.exe
-Reputation: -47
-Malicious:  52
-Suspicious: 0
-Undetected: 12
-Harmless:   0
-Threat:     trojan.generic/agent
+Hash (SHA-256): e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+Name:           suspicious-file.exe
+Reputation:     -47
+Malicious:      52
+Suspicious:     0
+Undetected:     12
+Harmless:       0
+Threat:         trojan.generic/agent
 ```
 
 ### Look up a known hash
 
 ```bash
 hashchecker 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
+```
+
+### Use a different hash algorithm
+
+```bash
+# Hash a file with SHA-1
+hashchecker -algo sha1 /path/to/file.exe
+
+# Look up an MD5 hash directly
+hashchecker -algo md5 d41d8cd98f00b204e9800998ecf8427e
+
+# Scan a directory using SHA-1
+hashchecker -algo sha1 -r ~/Downloads
 ```
 
 ### Scan a directory
@@ -194,14 +208,14 @@ hashchecker -o json /path/to/file
 ```
 
 ```json
-{"hash":"e3b0c44...","result":{"found":true,"name":"file.exe","reputation":-47,"malicious":52,"suspicious":0,"undetected":12,"harmless":0,"threat_label":"trojan.generic/agent"}}
+{"hash":"e3b0c44...","algorithm":"sha256","result":{"found":true,"name":"file.exe","reputation":-47,"malicious":52,"suspicious":0,"undetected":12,"harmless":0,"threat_label":"trojan.generic/agent"}}
 ```
 
 For directory scans, each file produces one JSON line followed by a summary line:
 
 ```json
-{"path":"/path/to/file1","hash":"abc123...","result":{...}}
-{"path":"/path/to/file2","hash":"def456...","result":{...}}
+{"path":"/path/to/file1","hash":"abc123...","algorithm":"sha256","result":{...}}
+{"path":"/path/to/file2","hash":"def456...","algorithm":"sha256","result":{...}}
 {"summary":{"path":"/path/to/dir","scanned":2,"found":2,"malicious":1}}
 ```
 
@@ -327,12 +341,12 @@ go test ./...
 The test suite has **102 tests** (including subtests) across 4 test files with **~85% statement coverage**.
 
 **`main_test.go`** — Core logic and end-to-end `run()` tests:
-- **`TestIsHexHash`** — SHA-256 hash detection (valid upper/lowercase, too short, too long, non-hex, empty, MD5-length)
-- **`TestHashFile`** — file hashing (known content, empty file, nonexistent file error)
+- **`TestIsHexHash`** — hash detection for all algorithms (SHA-256 valid/invalid, SHA-1 valid/cross-rejection, MD5 valid/cross-rejection, unsupported algorithm)
+- **`TestHashFile`** — file hashing across algorithms (SHA-256, SHA-1, MD5 known content, unsupported algo error, nonexistent file error)
 - **`TestTruncateRunes`** — string truncation with multi-byte character safety
 - **`TestParseRetryAfter`** — Retry-After header parsing (integers, zero, negative, garbage, RFC 1123 dates)
 - **`TestShouldProcess`** — file filter logic (include/exclude globs, size bounds, combined filters)
-- **`TestRun*`** — end-to-end tests for `run()`: flag validation (version, no args, missing API key, invalid output/patterns/sizes), hash lookups (clean + malicious exit codes), single file scanning with size filters, directory scanning (flat, recursive, JSON, include/exclude)
+- **`TestRun*`** — end-to-end tests for `run()`: flag validation (version, no args, missing API key, invalid output/patterns/sizes/algo), hash lookups (clean, malicious, MD5), single file scanning (default SHA-256, SHA-1, size filters), directory scanning (flat, recursive, JSON, include/exclude)
 
 **`virustotal_test.go`** — httptest-based integration tests:
 - **`TestCheckVirusTotal`** — HTTP client against a mock server (200 success, clean file, 404 not found, 429 retry, 429 exhausted, 403 bad key, bad JSON, context cancellation)
@@ -347,6 +361,7 @@ The test suite has **102 tests** (including subtests) across 4 test files with *
 
 **`cache_test.go`** — Filesystem operations:
 - **`TestLoadCache`** — missing file, valid file, corrupt JSON graceful degradation
+- **`TestLoadCacheMigratesLegacyKeys`** — verifies bare-hash keys are migrated to `sha256:hash` format
 - **`TestSaveCache`** — file permissions (0600), JSON validity, save-then-load round-trip
 - **`TestGetCacheFilePath`** — path suffix verification
 

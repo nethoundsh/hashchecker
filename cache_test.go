@@ -25,10 +25,10 @@ func TestLoadCache(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "results.json")
 
-		// Write a valid cache file
+		// Write a valid cache file with the new "algo:hash" key format.
 		now := time.Now().Truncate(time.Second) // truncate for JSON round-trip
 		data := map[string]cacheEntry{
-			"abc123": {
+			"sha256:abc123": {
 				Result:    VirusTotalResult{Found: true, Name: "test.exe", Malicious: 5},
 				Timestamp: now,
 			},
@@ -48,9 +48,9 @@ func TestLoadCache(t *testing.T) {
 		if len(cache) != 1 {
 			t.Fatalf("expected 1 entry, got %d", len(cache))
 		}
-		entry, ok := cache["abc123"]
+		entry, ok := cache["sha256:abc123"]
 		if !ok {
-			t.Fatal("expected key 'abc123' in cache")
+			t.Fatal("expected key 'sha256:abc123' in cache")
 		}
 		if entry.Result.Name != "test.exe" {
 			t.Fatalf("Name = %q, want %q", entry.Result.Name, "test.exe")
@@ -77,13 +77,59 @@ func TestLoadCache(t *testing.T) {
 	})
 }
 
+func TestLoadCacheMigratesLegacyKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "results.json")
+
+	// Write a cache file with legacy bare-hash keys (no "algo:" prefix).
+	now := time.Now().Truncate(time.Second)
+	data := map[string]cacheEntry{
+		"abc123": {
+			Result:    VirusTotalResult{Found: true, Name: "legacy.exe", Malicious: 1},
+			Timestamp: now,
+		},
+		"sha256:def456": {
+			Result:    VirusTotalResult{Found: true, Name: "already-migrated.exe"},
+			Timestamp: now,
+		},
+	}
+	b, err := json.Marshal(data)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	cache, err := loadCache(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Legacy key should have been migrated to "sha256:abc123".
+	if _, ok := cache["abc123"]; ok {
+		t.Fatal("bare key 'abc123' should have been migrated")
+	}
+	if _, ok := cache["sha256:abc123"]; !ok {
+		t.Fatal("expected migrated key 'sha256:abc123'")
+	}
+	if cache["sha256:abc123"].Result.Name != "legacy.exe" {
+		t.Fatalf("migrated entry Name = %q, want %q", cache["sha256:abc123"].Result.Name, "legacy.exe")
+	}
+
+	// Already-prefixed key should be unchanged.
+	if _, ok := cache["sha256:def456"]; !ok {
+		t.Fatal("expected key 'sha256:def456' to remain")
+	}
+}
+
 func TestSaveCache(t *testing.T) {
 	t.Run("normal save", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "sub", "results.json")
 
 		data := map[string]cacheEntry{
-			"hash1": {
+			"sha256:hash1": {
 				Result:    VirusTotalResult{Found: true, Name: "file.exe"},
 				Timestamp: time.Now(),
 			},
@@ -110,8 +156,8 @@ func TestSaveCache(t *testing.T) {
 		if err := json.Unmarshal(b, &parsed); err != nil {
 			t.Fatalf("saved file is not valid JSON: %v", err)
 		}
-		if _, ok := parsed["hash1"]; !ok {
-			t.Fatal("saved file missing key 'hash1'")
+		if _, ok := parsed["sha256:hash1"]; !ok {
+			t.Fatal("saved file missing key 'sha256:hash1'")
 		}
 	})
 
@@ -121,11 +167,11 @@ func TestSaveCache(t *testing.T) {
 
 		now := time.Now().Truncate(time.Second)
 		original := map[string]cacheEntry{
-			"aaa": {
+			"sha256:aaa": {
 				Result:    VirusTotalResult{Found: true, Name: "a.exe", Malicious: 1},
 				Timestamp: now,
 			},
-			"bbb": {
+			"md5:bbb": {
 				Result:    VirusTotalResult{Found: false},
 				Timestamp: now,
 			},
