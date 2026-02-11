@@ -294,17 +294,29 @@ Error: writing cache: write /tmp/results.json.tmp: no space left on device
 
 ```
 hashchecker/
-  main.go              Entry point, CLI flags, run() setup, dispatch helpers (runHash, runDir, runFile), hashing
-  virustotal.go        VirusTotal API client, result types, rate limiting, retry logic
-  output.go            Text and JSON output formatting, color helpers
-  cache.go             Disk cache: load, save (atomic), expiry
-  filter.go            File filtering by glob pattern and size
-  main_test.go         Tests for run(), hashing, filters, retry parsing
-  virustotal_test.go   httptest integration tests for API client, caching, rate limiting
-  output_test.go       Output formatting and color helper tests
-  cache_test.go        Filesystem tests for cache load/save/round-trip
-  go.mod               Module definition and dependencies
+  main.go                        Entry point, CLI flags, run() setup, dispatch helpers (runHash, runDir, runFile), hashing
+  virustotal.go                  VirusTotal API client, result types, rate limiting, retry logic
+  output.go                      Text and JSON output formatting, color helpers
+  cache.go                       Disk cache: load, save (atomic), expiry
+  filter.go                      File filtering by glob pattern and size
+  main_test.go                   Tests for run(), hashing, filters, retry parsing
+  virustotal_test.go             httptest integration tests for API client, caching, rate limiting
+  output_test.go                 Output formatting and color helper tests
+  cache_test.go                  Filesystem tests for cache load/save/round-trip
+  go.mod                         Module definition and dependencies
+  .github/workflows/ci.yml      GitHub Actions CI: golangci-lint + tests on push/PR
 ```
+
+## CI
+
+Every push to `main` and every pull request runs two GitHub Actions jobs automatically:
+
+| Job | What it does |
+|-----|--------------|
+| **Lint** | Runs [golangci-lint](https://golangci-lint.run/) to enforce `gofmt` formatting, `go vet` diagnostics, and a broad set of static-analysis checks (unused code, error handling, shadowed variables, etc.) |
+| **Test** | Runs `go build`, `go vet`, and `go test -race -cover` to catch regressions and data races |
+
+The workflow is defined in [`.github/workflows/ci.yml`](.github/workflows/ci.yml). The Go version is read from `go.mod` so it stays in sync automatically.
 
 ## Running tests
 

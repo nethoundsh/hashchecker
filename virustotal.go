@@ -142,6 +142,12 @@ func waitForRateLimit(ctx context.Context, limiter *rate.Limiter) error {
 	if err := limiter.Wait(ctx); err != nil {
 		return err
 	}
+	// Add 0–2999ms of random jitter after the token-bucket wait.
+	// Without this, requests fire at exactly the bucket interval
+	// (e.g. every 15.000s for 4 req/min), which looks machine-like
+	// and can trigger server-side bot detection. The jitter makes
+	// inter-request gaps vary (e.g. 15.0–18.0s) while staying
+	// safely under the rate limit.
 	jitter := time.Duration(rand.Intn(3000)) * time.Millisecond
 	time.Sleep(jitter)
 	return nil
