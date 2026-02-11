@@ -3,9 +3,14 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"flag"
+	"fmt"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -207,11 +212,29 @@ func TestParseRetryAfter(t *testing.T) {
 			in:   "not-a-number",
 			want: 60 * time.Second,
 		},
+		{
+			name: "RFC1123 date in the future",
+			in:   time.Now().Add(30 * time.Second).UTC().Format(time.RFC1123),
+			want: 30 * time.Second,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := parseRetryAfter(tt.in); got != tt.want {
+			got := parseRetryAfter(tt.in)
+			// RFC1123 dates produce an approximate duration (time.Until is
+			// evaluated at call time), so we allow ±2s tolerance for that case.
+			if tt.name == "RFC1123 date in the future" {
+				diff := got - tt.want
+				if diff < 0 {
+					diff = -diff
+				}
+				if diff > 2*time.Second {
+					t.Fatalf("parseRetryAfter(%q) = %v, want ~%v (±2s)", tt.in, got, tt.want)
+				}
+				return
+			}
+			if got != tt.want {
 				t.Fatalf("parseRetryAfter(%q) = %v, want %v", tt.in, got, tt.want)
 			}
 		})
@@ -340,6 +363,349 @@ func TestShouldProcess(t *testing.T) {
 				t.Fatalf("shouldProcess() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// callRun resets the global flag state, sets os.Args, and calls run().
+// This lets us test run()'s early validation paths without making real
+// API calls. The flag.CommandLine reset is necessary because Go's flag
+// package uses global state — without it, flags from previous test
+// cases would conflict.
+//
+// IMPORTANT: These tests cannot run in parallel because they modify
+// os.Args and flag.CommandLine (global state).
+func callRun(t *testing.T, args ...string) (exitCode int, stdout string) {
+	t.Helper()
+	os.Args = append([]string{"hashchecker"}, args...)
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	var code int
+	out := captureStdout(t, func() {
+		code = run()
+	})
+	return code, out
+}
+
+func TestRunVersion(t *testing.T) {
+	code, stdout := callRun(t, "-version")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "hashchecker") {
+		t.Fatalf("expected version output, got %q", stdout)
+	}
+}
+
+func TestRunNoArgs(t *testing.T) {
+	// With no positional args, run() should print usage and return 1.
+	t.Setenv("VIRUSTOTAL_API_KEY", "fake-key")
+	code, _ := callRun(t)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunMissingAPIKey(t *testing.T) {
+	t.Setenv("VIRUSTOTAL_API_KEY", "")
+	code, _ := callRun(t, "somefile.txt")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunInvalidOutputFormat(t *testing.T) {
+	t.Setenv("VIRUSTOTAL_API_KEY", "fake-key")
+	code, _ := callRun(t, "-o", "xml", "somefile.txt")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunInvalidIncludePattern(t *testing.T) {
+	t.Setenv("VIRUSTOTAL_API_KEY", "fake-key")
+	code, _ := callRun(t, "-include", "[bad", "somefile.txt")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunInvalidExcludePattern(t *testing.T) {
+	t.Setenv("VIRUSTOTAL_API_KEY", "fake-key")
+	code, _ := callRun(t, "-exclude", "[bad", "somefile.txt")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunInvalidMinSize(t *testing.T) {
+	t.Setenv("VIRUSTOTAL_API_KEY", "fake-key")
+	code, _ := callRun(t, "-min-size", "not-a-size", "somefile.txt")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunInvalidMaxSize(t *testing.T) {
+	t.Setenv("VIRUSTOTAL_API_KEY", "fake-key")
+	code, _ := callRun(t, "-max-size", "not-a-size", "somefile.txt")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunMinSizeGreaterThanMaxSize(t *testing.T) {
+	t.Setenv("VIRUSTOTAL_API_KEY", "fake-key")
+	code, _ := callRun(t, "-min-size", "100MB", "-max-size", "1MB", "somefile.txt")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunNonexistentFile(t *testing.T) {
+	t.Setenv("VIRUSTOTAL_API_KEY", "fake-key")
+	code, _ := callRun(t, "/nonexistent/path/file.txt")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunFreeModeFlag(t *testing.T) {
+	// Exercises the rate limiter setup path (effectiveRate > 0)
+	t.Setenv("VIRUSTOTAL_API_KEY", "fake-key")
+	code, _ := callRun(t, "-free", "/nonexistent/path/file.txt")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunCustomRateFlag(t *testing.T) {
+	t.Setenv("VIRUSTOTAL_API_KEY", "fake-key")
+	code, _ := callRun(t, "-rate", "10", "/nonexistent/path/file.txt")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+func TestRunNoCacheFlag(t *testing.T) {
+	t.Setenv("VIRUSTOTAL_API_KEY", "fake-key")
+	code, _ := callRun(t, "-no-cache", "/nonexistent/path/file.txt")
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+}
+
+// startMockVT creates a mock VirusTotal server and sets up the env vars
+// for run() to use it. Returns the server (caller must defer srv.Close()).
+func startMockVT(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		fmt.Fprint(w, `{
+			"data": {
+				"attributes": {
+					"meaningful_name": "test.exe",
+					"reputation": 0,
+					"last_analysis_stats": {
+						"malicious": 0,
+						"suspicious": 0,
+						"undetected": 5,
+						"harmless": 60
+					},
+					"popular_threat_classification": {
+						"suggested_threat_label": ""
+					}
+				}
+			}
+		}`)
+	}))
+	t.Setenv("VIRUSTOTAL_API_KEY", "test-key")
+	t.Setenv("VIRUSTOTAL_BASE_URL", srv.URL+"/")
+	return srv
+}
+
+func TestRunHashLookup(t *testing.T) {
+	srv := startMockVT(t)
+	defer srv.Close()
+
+	// Valid SHA-256 hash (of empty file)
+	hash := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	code, stdout := callRun(t, "-no-cache", hash)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, hash) {
+		t.Fatalf("output should contain hash, got %q", stdout)
+	}
+}
+
+func TestRunHashLookupMalicious(t *testing.T) {
+	// Mock server returns malicious > 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		fmt.Fprint(w, `{
+			"data": {
+				"attributes": {
+					"meaningful_name": "evil.exe",
+					"reputation": -10,
+					"last_analysis_stats": {
+						"malicious": 42,
+						"suspicious": 3,
+						"undetected": 5,
+						"harmless": 10
+					},
+					"popular_threat_classification": {
+						"suggested_threat_label": "trojan.generic"
+					}
+				}
+			}
+		}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("VIRUSTOTAL_API_KEY", "test-key")
+	t.Setenv("VIRUSTOTAL_BASE_URL", srv.URL+"/")
+
+	hash := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	code, _ := callRun(t, "-no-cache", hash)
+	// Exit code 2 = malicious file found
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2", code)
+	}
+}
+
+func TestRunSingleFile(t *testing.T) {
+	srv := startMockVT(t)
+	defer srv.Close()
+
+	// Create a temp file to hash
+	tmpFile := filepath.Join(t.TempDir(), "testfile.txt")
+	if err := os.WriteFile(tmpFile, []byte("hello world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout := callRun(t, "-no-cache", tmpFile)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "test.exe") {
+		t.Fatalf("output should contain VT result name, got %q", stdout)
+	}
+}
+
+func TestRunSingleFileMinSizeFilter(t *testing.T) {
+	srv := startMockVT(t)
+	defer srv.Close()
+
+	tmpFile := filepath.Join(t.TempDir(), "tiny.txt")
+	if err := os.WriteFile(tmpFile, []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// File is 2 bytes, min-size is 1MB → should be skipped (exit 0, not error)
+	code, _ := callRun(t, "-no-cache", "-min-size", "1MB", tmpFile)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (filtered out)", code)
+	}
+}
+
+func TestRunSingleFileMaxSizeFilter(t *testing.T) {
+	srv := startMockVT(t)
+	defer srv.Close()
+
+	tmpFile := filepath.Join(t.TempDir(), "file.txt")
+	if err := os.WriteFile(tmpFile, make([]byte, 2048), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// File is 2048 bytes, max-size is 1KB (1024) → should be skipped
+	code, _ := callRun(t, "-no-cache", "-max-size", "1KB", tmpFile)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (filtered out)", code)
+	}
+}
+
+func TestRunDirectoryScan(t *testing.T) {
+	srv := startMockVT(t)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("bbb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout := callRun(t, "-no-cache", dir)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	// Should see summary line
+	if !strings.Contains(stdout, "Checked") && !strings.Contains(stdout, "files") {
+		t.Fatalf("expected summary line, got %q", stdout)
+	}
+}
+
+func TestRunDirectoryJSON(t *testing.T) {
+	srv := startMockVT(t)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout := callRun(t, "-no-cache", "-o", "json", dir)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	// Should contain JSON summary with "summary" key
+	if !strings.Contains(stdout, `"summary"`) {
+		t.Fatalf("expected JSON summary, got %q", stdout)
+	}
+}
+
+func TestRunDirectoryRecursive(t *testing.T) {
+	srv := startMockVT(t)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "subdir")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "root.txt"), []byte("root"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "nested.txt"), []byte("nested"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout := callRun(t, "-no-cache", "-r", dir)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	// With -r, both files should be scanned. Summary should say "2 files"
+	if !strings.Contains(stdout, "2 files") {
+		t.Fatalf("expected 2 files in summary, got %q", stdout)
+	}
+}
+
+func TestRunDirectoryWithIncludeExclude(t *testing.T) {
+	srv := startMockVT(t)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "keep.exe"), []byte("exe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "skip.log"), []byte("log"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Include only .exe, exclude .log
+	code, stdout := callRun(t, "-no-cache", "-include", "*.exe", dir)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "1 files") {
+		t.Fatalf("expected 1 file scanned, got %q", stdout)
 	}
 }
 

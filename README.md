@@ -273,13 +273,16 @@ hashchecker -cache-age 1 /path/to/file
 
 ```
 hashchecker/
-  main.go          Entry point, CLI flag parsing, run() orchestration, hashing utilities
-  virustotal.go    VirusTotal API client, result types, rate limiting, retry logic
-  output.go        Text and JSON output formatting, color helpers
-  cache.go         Disk cache: load, save (atomic), expiry
-  filter.go        File filtering by glob pattern and size
-  main_test.go     Table-driven tests (25 cases across 5 test functions)
-  go.mod           Module definition and dependencies
+  main.go              Entry point, CLI flag parsing, run() orchestration, hashing utilities
+  virustotal.go        VirusTotal API client, result types, rate limiting, retry logic
+  output.go            Text and JSON output formatting, color helpers
+  cache.go             Disk cache: load, save (atomic), expiry
+  filter.go            File filtering by glob pattern and size
+  main_test.go         Tests for run(), hashing, filters, retry parsing
+  virustotal_test.go   httptest integration tests for API client, caching, rate limiting
+  output_test.go       Output formatting and color helper tests
+  cache_test.go        Filesystem tests for cache load/save/round-trip
+  go.mod               Module definition and dependencies
 ```
 
 ## Running tests
@@ -288,13 +291,37 @@ hashchecker/
 go test ./...
 ```
 
-The test suite covers:
+The test suite has **75 tests** across 4 test files with **85% statement coverage**.
 
-- **`TestIsHexHash`** — validates SHA-256 hash detection (valid upper/lowercase, too short, too long, non-hex, empty, MD5-length rejection)
-- **`TestHashFile`** — SHA-256 file hashing (known content, empty file, nonexistent file error)
+**`main_test.go`** — Core logic and end-to-end `run()` tests:
+- **`TestIsHexHash`** — SHA-256 hash detection (valid upper/lowercase, too short, too long, non-hex, empty, MD5-length)
+- **`TestHashFile`** — file hashing (known content, empty file, nonexistent file error)
 - **`TestTruncateRunes`** — string truncation with multi-byte character safety
-- **`TestParseRetryAfter`** — HTTP Retry-After header parsing (integers, zero, negative, garbage input)
+- **`TestParseRetryAfter`** — Retry-After header parsing (integers, zero, negative, garbage, RFC 1123 dates)
 - **`TestShouldProcess`** — file filter logic (include/exclude globs, size bounds, combined filters)
+- **`TestRun*`** — end-to-end tests for `run()`: flag validation (version, no args, missing API key, invalid output/patterns/sizes), hash lookups (clean + malicious exit codes), single file scanning with size filters, directory scanning (flat, recursive, JSON, include/exclude)
+
+**`virustotal_test.go`** — httptest-based integration tests:
+- **`TestCheckVirusTotal`** — HTTP client against a mock server (200 success, clean file, 404 not found, 429 retry, 429 exhausted, 403 bad key, bad JSON, context cancellation)
+- **`TestCheckVirusTotalSendsAPIKey`** — verifies API key header is sent
+- **`TestLookupAndPrint`** — cache + API + output integration (cache miss, cache hit, expired cache, refresh bypass, JSON output)
+- **`TestWaitForRateLimit`** — rate limiter (nil limiter, fast limiter, cancelled context)
+
+**`output_test.go`** — Output formatting:
+- **`TestPrintJSON`** / **`TestPrintJSONSummary`** — JSON output structure and `omitempty` behavior
+- **`TestPrintResult`** — human-readable output (found with details, not found message)
+- **`TestColorHelpers`** — ANSI color selection for reputation, malicious, and suspicious counts
+
+**`cache_test.go`** — Filesystem operations:
+- **`TestLoadCache`** — missing file, valid file, corrupt JSON graceful degradation
+- **`TestSaveCache`** — file permissions (0600), JSON validity, save-then-load round-trip
+- **`TestGetCacheFilePath`** — path suffix verification
+
+Check coverage:
+
+```bash
+go test -cover ./...
+```
 
 ## Security considerations
 

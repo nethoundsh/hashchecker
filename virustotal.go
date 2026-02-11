@@ -42,6 +42,7 @@ type lookupConfig struct {
 	refresh      bool
 	cacheAgeDays int
 	limiter      *rate.Limiter
+	baseURL      string // base URL for VT API; empty defaults to production
 }
 
 // lookupAndPrint is the central "do the thing" function: it checks the
@@ -97,7 +98,7 @@ func lookupAndPrint(path, hash string, cfg lookupConfig) (VirusTotalResult, erro
 	// ── API Call ─────────────────────────────────────────────────────
 	//
 	// Cache miss (or -refresh forced): query VirusTotal.
-	result, err := checkVirusTotal(cfg.ctx, cfg.client, cfg.apiKey, hash)
+	result, err := checkVirusTotal(cfg.ctx, cfg.client, cfg.apiKey, hash, cfg.baseURL)
 	if err != nil {
 		return VirusTotalResult{}, err
 	}
@@ -187,7 +188,10 @@ func parseRetryAfter(header string) time.Duration {
 // Why retry here instead of in the caller? Because 429 handling is an
 // HTTP-level concern — the caller (lookupAndPrint) shouldn't need to
 // know about HTTP status codes or retry semantics.
-func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash string) (VirusTotalResult, error) {
+func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, baseURL string) (VirusTotalResult, error) {
+	if baseURL == "" {
+		baseURL = "https://www.virustotal.com/api/v3/files/"
+	}
 	const maxRetries = 3
 
 	for attempt := range maxRetries {
@@ -195,7 +199,7 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash stri
 		// (e.g. on Ctrl+C). http.NewRequestWithContext attaches the
 		// context to the request — if the context is cancelled, the
 		// HTTP client aborts the in-flight request immediately.
-		req, err := http.NewRequestWithContext(ctx, "GET", "https://www.virustotal.com/api/v3/files/"+hash, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", baseURL+hash, nil)
 		if err != nil {
 			return VirusTotalResult{}, err
 		}

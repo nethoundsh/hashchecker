@@ -332,6 +332,7 @@ func run() int {
 		refresh:      *refresh,
 		cacheAgeDays: *cacheAge,
 		limiter:      limiter,
+		baseURL:      os.Getenv("VIRUSTOTAL_BASE_URL"),
 	}
 
 	// ── Branch 1: Raw SHA-256 Hash ──────────────────────────────────────
