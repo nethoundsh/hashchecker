@@ -32,7 +32,7 @@ type cacheEntry struct {
 func getCacheFilePath() (string, error) {
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("locating cache directory: %w", err)
 	}
 	return filepath.Join(cacheDir, "hashchecker", "results.json"), nil
 }
@@ -54,7 +54,7 @@ func loadCache(path string) (map[string]cacheEntry, error) {
 		return cache, nil // first run — no cache file yet, not an error
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("opening cache %s: %w", path, err)
 	}
 	defer cacheFile.Close()
 
@@ -85,17 +85,20 @@ func loadCache(path string) (map[string]cacheEntry, error) {
 // the base.
 func saveCache(path string, cache map[string]cacheEntry) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+		return fmt.Errorf("creating cache directory: %w", err)
 	}
 
 	jsonBytes, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("marshaling cache: %w", err)
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, jsonBytes, 0o600); err != nil {
-		return err
+		return fmt.Errorf("writing cache: %w", err)
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("committing cache file: %w", err)
+	}
+	return nil
 }
 

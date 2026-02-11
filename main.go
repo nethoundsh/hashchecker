@@ -151,7 +151,7 @@ func run() int {
 	validatePatterns := func(flagName string, patterns []string) error {
 		for _, p := range patterns {
 			if _, err := filepath.Match(p, "test"); err != nil {
-				return fmt.Errorf("invalid %s pattern %q: %v", flagName, p, err)
+				return fmt.Errorf("invalid %s pattern %q: %w", flagName, p, err)
 			}
 		}
 		return nil
@@ -564,7 +564,7 @@ func isHexHash(s string) bool {
 func hashFile(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("hashing %s: %w", filePath, err)
 	}
 	defer file.Close()
 
@@ -574,7 +574,7 @@ func hashFile(filePath string) (string, error) {
 	hash := sha256.New()
 	_, err = io.Copy(hash, file)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("hashing %s: %w", filePath, err)
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }

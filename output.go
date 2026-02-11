@@ -54,7 +54,7 @@ func printJSON(path, hash string, vtResult VirusTotalResult) error {
 	}
 	b, err := json.Marshal(rec)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshaling JSON output: %w", err)
 	}
 	fmt.Println(string(b))
 	return nil
@@ -74,7 +74,7 @@ func printJSONSummary(path string, scanned, found, malicious int) error {
 	}
 	b, err := json.Marshal(rec)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshaling JSON summary: %w", err)
 	}
 	fmt.Println(string(b))
 	return nil

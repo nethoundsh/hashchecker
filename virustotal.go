@@ -74,7 +74,7 @@ func lookupAndPrint(path, hash string, cfg lookupConfig) (VirusTotalResult, erro
 				switch cfg.output {
 				case "json":
 					if err := printJSON(path, hash, entry.Result); err != nil {
-						return VirusTotalResult{}, err
+						return VirusTotalResult{}, fmt.Errorf("formatting output: %w", err)
 					}
 				default:
 					printResult(hash, entry.Result)
@@ -114,7 +114,7 @@ func lookupAndPrint(path, hash string, cfg lookupConfig) (VirusTotalResult, erro
 	switch cfg.output {
 	case "json":
 		if err := printJSON(path, hash, result); err != nil {
-			return VirusTotalResult{}, err
+			return VirusTotalResult{}, fmt.Errorf("formatting output: %w", err)
 		}
 	default:
 		printResult(hash, result)
@@ -201,7 +201,7 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, bas
 		// HTTP client aborts the in-flight request immediately.
 		req, err := http.NewRequestWithContext(ctx, "GET", baseURL+hash, nil)
 		if err != nil {
-			return VirusTotalResult{}, err
+			return VirusTotalResult{}, fmt.Errorf("checking virustotal %s: %w", hash, err)
 		}
 		// VirusTotal authenticates via an API key in a custom header.
 		req.Header.Set("x-apikey", apiKey)
@@ -209,7 +209,7 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, bas
 		// client.Do sends the request and returns the response.
 		response, err := client.Do(req)
 		if err != nil {
-			return VirusTotalResult{}, err
+			return VirusTotalResult{}, fmt.Errorf("checking virustotal %s: %w", hash, err)
 		}
 
 		// Read the entire response body into memory so we can both check
@@ -222,7 +222,7 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, bas
 		body, err := io.ReadAll(response.Body)
 		response.Body.Close()
 		if err != nil {
-			return VirusTotalResult{}, err
+			return VirusTotalResult{}, fmt.Errorf("reading virustotal response for %s: %w", hash, err)
 		}
 
 		// ── Handle 429 (rate limited) ───────────────────────────────
@@ -237,7 +237,7 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, bas
 		// immediately instead of sleeping for the full duration.
 		if response.StatusCode == 429 {
 			if attempt == maxRetries-1 {
-				return VirusTotalResult{}, fmt.Errorf("rate limited by VirusTotal after %d retries", maxRetries)
+				return VirusTotalResult{}, fmt.Errorf("checking virustotal %s: rate limited after %d retries", hash, maxRetries)
 			}
 			wait := parseRetryAfter(response.Header.Get("Retry-After"))
 			fmt.Fprintf(os.Stderr, "Rate limited (429), retrying in %s...\n", wait)
@@ -259,7 +259,7 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, bas
 			// include a truncated body snippet in the error so the user can
 			// see what VT said.
 			bodyStr := truncateRunes(string(body), 200)
-			return VirusTotalResult{}, fmt.Errorf("unexpected status: %d: %s", response.StatusCode, bodyStr)
+			return VirusTotalResult{}, fmt.Errorf("checking virustotal %s: unexpected status: %d: %s", hash, response.StatusCode, bodyStr)
 		}
 
 		// ── Parse the VT API v3 response ────────────────────────────
@@ -294,7 +294,7 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, bas
 		// fmt.Errorf with %w wraps the original error so callers can
 		// unwrap it with errors.Is/errors.As if needed.
 		if err := json.Unmarshal(body, &result); err != nil {
-			return VirusTotalResult{}, fmt.Errorf("parsing response: %w", err)
+			return VirusTotalResult{}, fmt.Errorf("checking virustotal %s: parsing response: %w", hash, err)
 		}
 
 		// Map the deeply nested API response into our flat result struct.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io/fs"
 	"path/filepath"
 )
@@ -75,7 +76,7 @@ func shouldProcess(d fs.DirEntry, includes, excludes []string, minSize, maxSize 
 			// The file might have been deleted or become inaccessible
 			// between WalkDir discovering it and us calling Info().
 			// Return the error so the caller can log it and continue.
-			return false, err
+			return false, fmt.Errorf("reading file info: %w", err)
 		}
 		fileSize := info.Size()
 
