@@ -294,7 +294,7 @@ Error: writing cache: write /tmp/results.json.tmp: no space left on device
 
 ```
 hashchecker/
-  main.go              Entry point, CLI flag parsing, run() orchestration, hashing utilities
+  main.go              Entry point, CLI flags, run() setup, dispatch helpers (runHash, runDir, runFile), hashing
   virustotal.go        VirusTotal API client, result types, rate limiting, retry logic
   output.go            Text and JSON output formatting, color helpers
   cache.go             Disk cache: load, save (atomic), expiry
@@ -312,7 +312,7 @@ hashchecker/
 go test ./...
 ```
 
-The test suite has **75 tests** across 4 test files with **85% statement coverage**.
+The test suite has **102 tests** (including subtests) across 4 test files with **~85% statement coverage**.
 
 **`main_test.go`** — Core logic and end-to-end `run()` tests:
 - **`TestIsHexHash`** — SHA-256 hash detection (valid upper/lowercase, too short, too long, non-hex, empty, MD5-length)

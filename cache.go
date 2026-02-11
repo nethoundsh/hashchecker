@@ -47,7 +47,7 @@ func getCacheFilePath() (string, error) {
 // Go idiom: errors.Is(err, os.ErrNotExist) checks for the specific
 // "file not found" sentinel, regardless of how it's wrapped. This is
 // preferred over os.IsNotExist(err) in modern Go.
-func loadCache(path string) (map[string]cacheEntry, error) {
+func loadCache(path string) (_ map[string]cacheEntry, err error) {
 	cache := make(map[string]cacheEntry)
 	cacheFile, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -56,7 +56,11 @@ func loadCache(path string) (map[string]cacheEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening cache %s: %w", path, err)
 	}
-	defer cacheFile.Close()
+	defer func() {
+		if closeErr := cacheFile.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("closing cache %s: %w", path, closeErr)
+		}
+	}()
 
 	// json.NewDecoder streams from the file reader instead of reading
 	// the whole file into memory first. For a cache file this is
@@ -97,6 +101,7 @@ func saveCache(path string, cache map[string]cacheEntry) error {
 		return fmt.Errorf("writing cache: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp) // best-effort cleanup
 		return fmt.Errorf("committing cache file: %w", err)
 	}
 	return nil

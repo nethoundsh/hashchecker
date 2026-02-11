@@ -49,6 +49,19 @@ var skipDirs = map[string]bool{
 	"vendor": true, ".venv": true, ".idea": true, ".vscode": true,
 }
 
+// scanConfig bundles the file-filter and scan flags that runFile and runDir
+// both need. Extracting these into a struct keeps parameter lists short when
+// passing filter state from run() to the helper functions.
+type scanConfig struct {
+	recursive  bool
+	includes   []string
+	excludes   []string
+	minSize    int64
+	maxSize    int64
+	minSizeStr string // original flag value for human-readable skip messages
+	maxSizeStr string
+}
+
 func main() {
 	os.Exit(run())
 }
@@ -335,187 +348,170 @@ func run() int {
 		baseURL:      os.Getenv("VIRUSTOTAL_BASE_URL"),
 	}
 
-	// ── Branch 1: Raw SHA-256 Hash ──────────────────────────────────────
+	// ── Dispatch ────────────────────────────────────────────────────────
 	//
-	// If the user passed a 64-character hex string, treat it as a hash
-	// and look it up directly — no file hashing needed.
-	if isHexHash(arg) {
-		// Normalize to lowercase so cache lookups are consistent.
-		hash := strings.ToLower(arg)
-		result, err := lookupAndPrint("", hash, cfg)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			return 1
-		}
-		// Exit code 2 signals "malicious file found" to the calling
-		// process. This lets hashchecker be used in CI pipelines or
-		// shell scripts with: hashchecker <hash> || echo "THREAT!"
-		if result.Found && result.Malicious > 0 {
-			return 2
-		}
-		return 0
+	// Bundle filter flags into a scanConfig for the helper functions,
+	// then dispatch to the appropriate handler based on the argument type.
+	sc := scanConfig{
+		recursive:  *recursive,
+		includes:   includes,
+		excludes:   excludes,
+		minSize:    minSize,
+		maxSize:    maxSize,
+		minSizeStr: *minSizeStr,
+		maxSizeStr: *maxSizeStr,
 	}
 
-	// ── Branch 2 & 3: File or Directory Path ────────────────────────────
-	//
-	// os.Stat retrieves file metadata without opening the file itself.
-	// It follows symlinks — if you need symlink-aware behavior, use
-	// os.Lstat instead.
+	if isHexHash(arg) {
+		return runHash(arg, cfg)
+	}
+
 	fi, err := os.Stat(arg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
-
-	// ── Branch 2: Directory Scan ────────────────────────────────────────
 	if fi.IsDir() {
-		// Track totals for the summary line printed at the end.
-		var looked, found, malicious int
+		return runDir(arg, cfg, sc)
+	}
+	return runFile(arg, fi, cfg, sc)
+}
 
-		// filepath.WalkDir traverses the directory tree. It calls our
-		// anonymous function (the "walk function") for every entry.
-		//
-		// Go idiom: WalkDir passes an fs.DirEntry instead of os.FileInfo
-		// (unlike the older filepath.Walk). DirEntry is lazier — it
-		// doesn't stat every file up front, which is faster for large
-		// directory trees.
-		err := filepath.WalkDir(arg, func(path string, d fs.DirEntry, err error) error {
-			// Bail out immediately if the context was cancelled
-			// (e.g. user pressed Ctrl+C). Returning the context error
-			// tells WalkDir to stop traversing.
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
+// ── Extracted Helpers ───────────────────────────────────────────────
+//
+// runHash, runDir, and runFile each handle one of the three dispatch
+// branches in run(). They return an exit code: 0 = clean, 1 = error,
+// 2 = malicious file(s) found.
 
-			// If WalkDir itself encountered an error accessing this path
-			// (e.g. permission denied), log it and continue rather than
-			// aborting the entire scan.
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Error:", path, err)
-				return nil // returning nil tells WalkDir to keep going
-			}
+// runHash handles the case where the user passes a raw SHA-256 hash
+// string. It normalizes the hash to lowercase, looks it up on
+// VirusTotal, and returns the appropriate exit code.
+func runHash(arg string, cfg lookupConfig) int {
+	hash := strings.ToLower(arg)
+	result, err := lookupAndPrint("", hash, cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		return 1
+	}
+	if result.Found && result.Malicious > 0 {
+		return 2
+	}
+	return 0
+}
 
-			// Handle directories: skip known-irrelevant dirs and
-			// respect the -r (recursive) flag.
-			if d.IsDir() {
-				// path != arg: don't skip the root directory itself.
-				if path != arg {
-					// Returning fs.SkipDir tells WalkDir to skip this
-					// entire subtree. It's the standard way to prune
-					// the walk — more efficient than entering the
-					// directory and skipping each child individually.
-					if skipDirs[d.Name()] {
-						return fs.SkipDir
-					}
-					if !*recursive {
-						return fs.SkipDir
-					}
+// runDir handles the case where the user passes a directory path.
+// It walks the directory tree (optionally recursive), hashes each
+// matching file, looks it up on VirusTotal, and prints a summary.
+func runDir(arg string, cfg lookupConfig, sc scanConfig) int {
+	var looked, found, malicious int
+
+	err := filepath.WalkDir(arg, func(path string, d fs.DirEntry, err error) error {
+		if cfg.ctx.Err() != nil {
+			return cfg.ctx.Err()
+		}
+
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", path, err)
+			return nil
+		}
+
+		if d.IsDir() {
+			if path != arg {
+				if skipDirs[d.Name()] {
+					return fs.SkipDir
 				}
-				return nil
-			}
-
-			// Skip non-regular files (symlinks, named pipes, device
-			// files, etc.) — we only want to hash actual file content.
-			if !d.Type().IsRegular() {
-				return nil
-			}
-
-			// ── Apply file filters ──────────────────────────────────
-			//
-			// Check -include, -exclude, -min-size, -max-size before
-			// doing any expensive work (hashing, API calls). This is
-			// the earliest point where we know we have a regular file.
-			ok, filterErr := shouldProcess(d, includes, excludes, minSize, maxSize)
-			if filterErr != nil {
-				fmt.Fprintln(os.Stderr, "Warning:", path, filterErr)
-				return nil // skip this file, continue scanning
-			}
-			if !ok {
-				return nil // file filtered out — skip silently
-			}
-
-			// Compute the SHA-256 hash of this file.
-			hash, err := hashFile(path)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Error:", path, err)
-				return nil // skip this file, continue scanning
-			}
-
-			// Print a visual separator between files in text mode.
-			if *output == "text" {
-				fmt.Println(color.HiBlueString("--- %s ---", path))
-			}
-
-			// Look up the hash on VirusTotal and print the result.
-			result, err := lookupAndPrint(path, hash, cfg)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Error:", err)
-				return nil // skip this file, continue scanning
-			}
-
-			// Update counters for the summary line.
-			looked++
-			if result.Found {
-				found++
-				if result.Malicious > 0 {
-					malicious++
+				if !sc.recursive {
+					return fs.SkipDir
 				}
 			}
 			return nil
-		})
+		}
+
+		if !d.Type().IsRegular() {
+			return nil
+		}
+
+		ok, filterErr := shouldProcess(d, sc.includes, sc.excludes, sc.minSize, sc.maxSize)
+		if filterErr != nil {
+			fmt.Fprintln(os.Stderr, "Warning:", path, filterErr)
+			return nil
+		}
+		if !ok {
+			return nil
+		}
+
+		hash, err := hashFile(path)
 		if err != nil {
-			if ctx.Err() != nil {
-				fmt.Fprintln(os.Stderr, "\nInterrupted")
-			} else {
-				fmt.Fprintln(os.Stderr, "Error:", err)
+			fmt.Fprintln(os.Stderr, "Error:", path, err)
+			return nil
+		}
+
+		if cfg.output == "text" {
+			fmt.Println(color.HiBlueString("--- %s ---", path))
+		}
+
+		result, err := lookupAndPrint(path, hash, cfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			return nil
+		}
+
+		looked++
+		if result.Found {
+			found++
+			if result.Malicious > 0 {
+				malicious++
 			}
+		}
+		return nil
+	})
+	if err != nil {
+		if cfg.ctx.Err() != nil {
+			fmt.Fprintln(os.Stderr, "\nInterrupted")
+		} else {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+		}
+		return 1
+	}
+
+	if cfg.output == "json" {
+		if err := printJSONSummary(arg, looked, found, malicious); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
 			return 1
 		}
-
-		// ── Print Directory Summary ─────────────────────────────────
-		if *output == "json" {
-			if err := printJSONSummary(arg, looked, found, malicious); err != nil {
-				fmt.Fprintln(os.Stderr, "Error:", err)
-				return 1
-			}
-		} else {
-			// Color the malicious count red if non-zero, green otherwise.
-			maliciousStr := color.GreenString("%d", malicious)
-			if malicious > 0 {
-				maliciousStr = color.RedString("%d", malicious)
-			}
-			fmt.Printf("Checked %d files, %d found in VirusTotal, %s malicious\n", looked, found, maliciousStr)
-		}
-
-		// Exit code 2 if any malicious files were found (see note above).
+	} else {
+		maliciousStr := color.GreenString("%d", malicious)
 		if malicious > 0 {
-			return 2
+			maliciousStr = color.RedString("%d", malicious)
 		}
-		return 0
+		fmt.Printf("Checked %d files, %d found in VirusTotal, %s malicious\n", looked, found, maliciousStr)
 	}
 
-	// ── Branch 3: Single File ───────────────────────────────────────────
-	//
-	// For single files, glob filters (-include/-exclude) are not
-	// applied — the user explicitly named this file, so we respect
-	// that choice. However, size filters still apply because the user
-	// may have a pipeline that enforces size constraints.
-	if minSize > 0 || maxSize > 0 {
-		fileSize := fi.Size() // fi is the os.FileInfo from the os.Stat call above
-		if minSize > 0 && fileSize < minSize {
+	if malicious > 0 {
+		return 2
+	}
+	return 0
+}
+
+// runFile handles the case where the user passes a path to a single file.
+// Glob filters (-include/-exclude) are not applied — the user explicitly
+// named this file. Size filters still apply because a pipeline may
+// enforce size constraints.
+func runFile(arg string, fi os.FileInfo, cfg lookupConfig, sc scanConfig) int {
+	if sc.minSize > 0 || sc.maxSize > 0 {
+		fileSize := fi.Size()
+		if sc.minSize > 0 && fileSize < sc.minSize {
 			fmt.Fprintf(os.Stderr, "Skipped: %s (%s) is smaller than -min-size %s\n",
-				arg, humanize.Bytes(uint64(fileSize)), *minSizeStr)
-			return 0 // not an error — just filtered out by user's own flags
+				arg, humanize.Bytes(uint64(fileSize)), sc.minSizeStr)
+			return 0
 		}
-		if maxSize > 0 && fileSize > maxSize {
+		if sc.maxSize > 0 && fileSize > sc.maxSize {
 			fmt.Fprintf(os.Stderr, "Skipped: %s (%s) is larger than -max-size %s\n",
-				arg, humanize.Bytes(uint64(fileSize)), *maxSizeStr)
-			return 0 // not an error — just filtered out by user's own flags
+				arg, humanize.Bytes(uint64(fileSize)), sc.maxSizeStr)
+			return 0
 		}
 	}
 
-	// Hash the file and look it up, just like in the directory scan
-	// but for a single target.
 	hash, err := hashFile(arg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
@@ -529,7 +525,6 @@ func run() int {
 	if result.Found && result.Malicious > 0 {
 		return 2
 	}
-
 	return 0
 }
 
@@ -561,12 +556,16 @@ func isHexHash(s string) bool {
 // hash (an io.Writer) in chunks. This means we never load the entire
 // file into memory — critical for hashing large files without running
 // out of RAM.
-func hashFile(filePath string) (string, error) {
+func hashFile(filePath string) (_ string, err error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return "", fmt.Errorf("hashing %s: %w", filePath, err)
+		return "", fmt.Errorf("hashing: %w", err) // os.Open already includes the path
 	}
-	defer file.Close()
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("hashing %s: %w", filePath, closeErr)
+		}
+	}()
 
 	// sha256.New() returns a hash.Hash, which implements io.Writer.
 	// Each Write call updates the running hash. Sum(nil) finalizes it

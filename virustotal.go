@@ -219,7 +219,7 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, bas
 		// in a loop. defer only runs when the function returns, so
 		// deferring inside a loop would keep all response bodies open
 		// until the function exits — a resource leak.
-		body, err := io.ReadAll(response.Body)
+		body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20)) // 1 MiB cap
 		response.Body.Close()
 		if err != nil {
 			return VirusTotalResult{}, fmt.Errorf("reading virustotal response for %s: %w", hash, err)

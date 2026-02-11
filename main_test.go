@@ -637,7 +637,7 @@ func TestRunDirectoryScan(t *testing.T) {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
 	// Should see summary line
-	if !strings.Contains(stdout, "Checked") && !strings.Contains(stdout, "files") {
+	if !strings.Contains(stdout, "Checked") || !strings.Contains(stdout, "files") {
 		t.Fatalf("expected summary line, got %q", stdout)
 	}
 }
