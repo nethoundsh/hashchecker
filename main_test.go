@@ -1,7 +1,11 @@
 package main
 
 import (
-	fs "io/fs"
+	"crypto/sha256"
+	"encoding/hex"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -60,6 +64,51 @@ func TestIsHexHash(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHashFile(t *testing.T) {
+	tests := []struct {
+		name    string
+		content []byte
+	}{
+		{
+			name:    "known content",
+			content: []byte("hashchecker test content"),
+		},
+		{
+			name:    "empty file",
+			content: []byte{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "testfile")
+			if err := os.WriteFile(path, tt.content, 0o644); err != nil {
+				t.Fatalf("writing temp file: %v", err)
+			}
+
+			// Compute expected hash directly with crypto/sha256.
+			sum := sha256.Sum256(tt.content)
+			want := hex.EncodeToString(sum[:])
+
+			got, err := hashFile(path)
+			if err != nil {
+				t.Fatalf("hashFile() error: %v", err)
+			}
+			if got != want {
+				t.Fatalf("hashFile() = %q, want %q", got, want)
+			}
+		})
+	}
+
+	// Error case: nonexistent file should return an error.
+	t.Run("nonexistent file", func(t *testing.T) {
+		_, err := hashFile(filepath.Join(t.TempDir(), "does-not-exist"))
+		if err == nil {
+			t.Fatal("hashFile() should return error for nonexistent file")
+		}
+	})
 }
 
 func TestTruncateRunes(t *testing.T) {

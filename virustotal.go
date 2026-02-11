@@ -34,6 +34,7 @@ type VirusTotalResult struct {
 // readable and makes it easy to add new options later without touching
 // every caller.
 type lookupConfig struct {
+	ctx          context.Context
 	client       *http.Client
 	apiKey       string
 	output       string
@@ -89,14 +90,14 @@ func lookupAndPrint(path, hash string, cfg lookupConfig) (VirusTotalResult, erro
 	// This is intentionally placed AFTER the cache check — cache hits
 	// don't consume rate limit tokens, which is the key improvement
 	// over the old approach of sleeping before every file regardless.
-	if err := waitForRateLimit(context.Background(), cfg.limiter); err != nil {
+	if err := waitForRateLimit(cfg.ctx, cfg.limiter); err != nil {
 		return VirusTotalResult{}, fmt.Errorf("rate limiter: %w", err)
 	}
 
 	// ── API Call ─────────────────────────────────────────────────────
 	//
 	// Cache miss (or -refresh forced): query VirusTotal.
-	result, err := checkVirusTotal(cfg.client, cfg.apiKey, hash)
+	result, err := checkVirusTotal(cfg.ctx, cfg.client, cfg.apiKey, hash)
 	if err != nil {
 		return VirusTotalResult{}, err
 	}
@@ -186,13 +187,15 @@ func parseRetryAfter(header string) time.Duration {
 // Why retry here instead of in the caller? Because 429 handling is an
 // HTTP-level concern — the caller (lookupAndPrint) shouldn't need to
 // know about HTTP status codes or retry semantics.
-func checkVirusTotal(client *http.Client, apiKey, hash string) (VirusTotalResult, error) {
+func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash string) (VirusTotalResult, error) {
 	const maxRetries = 3
 
 	for attempt := range maxRetries {
-		// Build the GET request. http.NewRequest returns a *Request that
-		// we can customize (headers, etc.) before sending.
-		req, err := http.NewRequest("GET", "https://www.virustotal.com/api/v3/files/"+hash, nil)
+		// Build the GET request with context so it can be cancelled
+		// (e.g. on Ctrl+C). http.NewRequestWithContext attaches the
+		// context to the request — if the context is cancelled, the
+		// HTTP client aborts the in-flight request immediately.
+		req, err := http.NewRequestWithContext(ctx, "GET", "https://www.virustotal.com/api/v3/files/"+hash, nil)
 		if err != nil {
 			return VirusTotalResult{}, err
 		}
@@ -224,13 +227,21 @@ func checkVirusTotal(client *http.Client, apiKey, hash string) (VirusTotalResult
 		// Retry-After header tells us how long to wait. We parse it
 		// with parseRetryAfter() (which handles both integer seconds
 		// and RFC 1123 date formats) and sleep before retrying.
+		//
+		// The select statement makes the wait cancellable — if the
+		// user presses Ctrl+C during a retry wait, we bail out
+		// immediately instead of sleeping for the full duration.
 		if response.StatusCode == 429 {
 			if attempt == maxRetries-1 {
 				return VirusTotalResult{}, fmt.Errorf("rate limited by VirusTotal after %d retries", maxRetries)
 			}
 			wait := parseRetryAfter(response.Header.Get("Retry-After"))
 			fmt.Fprintf(os.Stderr, "Rate limited (429), retrying in %s...\n", wait)
-			time.Sleep(wait)
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return VirusTotalResult{}, ctx.Err()
+			}
 			continue
 		}
 
@@ -320,4 +331,3 @@ func truncateRunes(s string, max int) string {
 	}
 	return string(r[:max]) + "..."
 }
-

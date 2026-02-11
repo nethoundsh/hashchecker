@@ -13,6 +13,7 @@ A command-line tool that computes SHA-256 hashes of files and checks them agains
 - **Colored output** — malicious results in red, suspicious in yellow, clean in green. Disable with `-no-color` or the `NO_COLOR` environment variable.
 - **JSON output** — use `-o json` for NDJSON (one JSON object per line), suitable for piping into `jq` or other tools.
 - **Result caching** — caches VirusTotal results locally (`~/.cache/hashchecker/results.json`) to avoid redundant API calls. Cached results expire after 7 days by default. Control with `-no-cache`, `-refresh`, and `-cache-age`. Cache writes are atomic (write to temp file, then rename) to prevent corruption.
+- **Graceful cancellation** — press Ctrl+C to cleanly interrupt long-running scans. In-flight rate-limit waits, HTTP requests, and directory walks exit immediately, and the cache is flushed before shutdown.
 - **Scriptable exit codes** — exit 0 for clean, 1 for errors, 2 when malicious files are detected.
 
 ## Prerequisites
@@ -277,7 +278,7 @@ hashchecker/
   output.go        Text and JSON output formatting, color helpers
   cache.go         Disk cache: load, save (atomic), expiry
   filter.go        File filtering by glob pattern and size
-  main_test.go     Table-driven tests (22 cases across 4 test functions)
+  main_test.go     Table-driven tests (25 cases across 5 test functions)
   go.mod           Module definition and dependencies
 ```
 
@@ -290,6 +291,7 @@ go test ./...
 The test suite covers:
 
 - **`TestIsHexHash`** — validates SHA-256 hash detection (valid upper/lowercase, too short, too long, non-hex, empty, MD5-length rejection)
+- **`TestHashFile`** — SHA-256 file hashing (known content, empty file, nonexistent file error)
 - **`TestTruncateRunes`** — string truncation with multi-byte character safety
 - **`TestParseRetryAfter`** — HTTP Retry-After header parsing (integers, zero, negative, garbage input)
 - **`TestShouldProcess`** — file filter logic (include/exclude globs, size bounds, combined filters)

@@ -11,6 +11,7 @@
 package main
 
 import (
+	"context"       // context.Context for cancellation propagation
 	"crypto/sha256" // SHA-256 hashing for file fingerprints
 	"encoding/hex"  // hex encode/decode — used for hash string conversion and validation
 	"flag"          // stdlib CLI flag parsing — simple and idiomatic for Go CLIs
@@ -19,6 +20,7 @@ import (
 	"io/fs"         // filesystem interfaces — fs.SkipDir for WalkDir control, DirEntry for file metadata
 	"net/http"      // HTTP client for VirusTotal API calls
 	"os"            // file operations, environment variables, exit codes
+	"os/signal"     // signal.NotifyContext for graceful Ctrl+C handling
 	"path/filepath" // cross-platform path manipulation and directory walking
 	"strings"       // string utilities — TrimSpace, ToLower
 	"time"          // durations for rate limiting and cache expiry
@@ -82,6 +84,14 @@ func run() int {
 	minSizeStr := flag.String("min-size", "", "minimum file size with units (e.g. \"1KB\", \"10MB\")")
 	maxSizeStr := flag.String("max-size", "", "maximum file size with units (e.g. \"100MB\", \"1GB\")")
 
+	// Customize the usage message printed by -h or when no arguments
+	// are provided. flag.PrintDefaults() formats all registered flags
+	// with their types and default values.
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: hashchecker [flags] <file | SHA-256 hash | directory>\n\nFlags:\n")
+		flag.PrintDefaults()
+	}
+
 	// flag.Parse() processes os.Args[1:] and populates all the flag
 	// pointers above. Any remaining non-flag arguments (the file path
 	// or hash) are available via flag.Arg(n) / flag.NArg().
@@ -93,6 +103,15 @@ func run() int {
 		fmt.Println("hashchecker", version)
 		return 0
 	}
+
+	// ── Signal Handling ─────────────────────────────────────────────
+	//
+	// Create a context that is cancelled when the user presses Ctrl+C.
+	// This lets long-running operations (rate-limit waits, HTTP requests)
+	// exit cleanly instead of hanging. The deferred stop() restores
+	// default signal behavior when run() returns.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
 	// ── Parse Filter Flags ──────────────────────────────────────────
 	//
@@ -229,7 +248,7 @@ func run() int {
 	// flag.NArg() returns the count of non-flag arguments remaining
 	// after flag.Parse().
 	if flag.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: hashchecker [-free] [-rate N] [-r] [-o text|json] [-no-color] [-include PATTERNS] [-exclude PATTERNS] [-min-size SIZE] [-max-size SIZE] [-version] <file|hash|directory>")
+		flag.Usage()
 		return 1
 	}
 
@@ -305,6 +324,7 @@ func run() int {
 	// Bundle the lookup configuration into a struct so we don't have to
 	// thread a long parameter list through every call site.
 	cfg := lookupConfig{
+		ctx:          ctx,
 		client:       client,
 		apiKey:       apiKey,
 		output:       *output,
@@ -359,6 +379,13 @@ func run() int {
 		// doesn't stat every file up front, which is faster for large
 		// directory trees.
 		err := filepath.WalkDir(arg, func(path string, d fs.DirEntry, err error) error {
+			// Bail out immediately if the context was cancelled
+			// (e.g. user pressed Ctrl+C). Returning the context error
+			// tells WalkDir to stop traversing.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
 			// If WalkDir itself encountered an error accessing this path
 			// (e.g. permission denied), log it and continue rather than
 			// aborting the entire scan.
@@ -436,7 +463,11 @@ func run() int {
 			return nil
 		})
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
+			if ctx.Err() != nil {
+				fmt.Fprintln(os.Stderr, "\nInterrupted")
+			} else {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+			}
 			return 1
 		}
 
@@ -452,7 +483,7 @@ func run() int {
 			if malicious > 0 {
 				maliciousStr = color.RedString("%d", malicious)
 			}
-			fmt.Printf("Scanned %d files, %d found in VirusTotal, %s malicious\n", looked, found, maliciousStr)
+			fmt.Printf("Checked %d files, %d found in VirusTotal, %s malicious\n", looked, found, maliciousStr)
 		}
 
 		// Exit code 2 if any malicious files were found (see note above).
