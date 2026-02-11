@@ -7,7 +7,8 @@ A command-line tool that computes file hashes and checks them against the [Virus
 - **Multi-hash support** — SHA-256 (default), SHA-1, and MD5 via the `-algo` flag. Files are streamed through `hash.Hash` so even large files are hashed without loading them entirely into memory.
 - **VirusTotal lookup** — queries the VirusTotal v3 API and reports malicious/suspicious/undetected/harmless engine counts, reputation score, and threat classification. The API natively accepts SHA-256, SHA-1, and MD5 hashes.
 - **Direct hash lookup** — pass a hex hash string instead of a file path to look up a hash you already have (64 chars for SHA-256, 40 for SHA-1, 32 for MD5).
-- **Directory scanning** — point it at a directory to scan all regular files (symlinks are skipped). Use `-r` for recursive scanning with automatic skipping of common non-essential directories (`.git`, `node_modules`, `__pycache__`, `vendor`, etc.).
+- **Directory scanning** — point it at a directory to scan all regular files (symlinks are skipped). Use `-r` for recursive scanning with automatic skipping of common non-essential directories (`.git`, `node_modules`, `__pycache__`, `vendor`, etc.). A progress bar shows file count, percentage, throughput, and ETA for long-running scans.
+- **Progress bar** — directory scans display a live progress bar on stderr with percentage, file count, throughput (files/s), and ETA. Automatically suppressed in JSON mode, when stderr is not a TTY (piped/redirected), or when `-no-progress` is passed.
 - **File filtering** — narrow which files get scanned with glob patterns (`-include`, `-exclude`) and size limits (`-min-size`, `-max-size`). Filters are applied before hashing, so excluded files don't waste CPU or API quota.
 - **Rate limiting** — the `-free` flag enforces VirusTotal's free-tier limit (4 requests/minute), or use `-rate N` for custom pacing. Uses a token-bucket limiter with random jitter to avoid bot detection.
 - **Colored output** — malicious results in red, suspicious in yellow, clean in green. Disable with `-no-color` or the `NO_COLOR` environment variable.
@@ -95,6 +96,7 @@ hashchecker [flags] <file | hash | directory>
 | `-r` | Recursively scan subdirectories (skips `.git`, `node_modules`, `__pycache__`, `vendor`, `.venv`, `.idea`, `.vscode`) |
 | `-o text\|json` | Output format. Default: `text`. Use `json` for NDJSON output |
 | `-no-color` | Disable colored terminal output |
+| `-no-progress` | Disable progress bar for directory scans |
 | `-no-cache` | Disable cache entirely (don't read or write) |
 | `-refresh` | Ignore cached results but still write new ones |
 | `-cache-age N` | Maximum age of cached results in days (default: 7) |
@@ -146,7 +148,13 @@ hashchecker -algo sha1 -r ~/Downloads
 hashchecker -free ~/Downloads
 ```
 
-Scans every regular file in the directory (non-recursive by default). With `-free`, requests are paced at 4 per minute using a token-bucket limiter.
+Scans every regular file in the directory (non-recursive by default). With `-free`, requests are paced at 4 per minute using a token-bucket limiter. A progress bar on stderr shows scan progress, ETA, and throughput.
+
+To disable the progress bar:
+
+```bash
+hashchecker -free -no-progress ~/Downloads
+```
 
 ### Recursive scan
 
@@ -338,7 +346,7 @@ The workflow is defined in [`.github/workflows/ci.yml`](.github/workflows/ci.yml
 go test ./...
 ```
 
-The test suite has **102 tests** (including subtests) across 4 test files with **~85% statement coverage**.
+The test suite has **123 tests** (including subtests) across 4 test files with **~85% statement coverage**.
 
 **`main_test.go`** — Core logic and end-to-end `run()` tests:
 - **`TestIsHexHash`** — hash detection for all algorithms (SHA-256 valid/invalid, SHA-1 valid/cross-rejection, MD5 valid/cross-rejection, unsupported algorithm)
@@ -346,7 +354,10 @@ The test suite has **102 tests** (including subtests) across 4 test files with *
 - **`TestTruncateRunes`** — string truncation with multi-byte character safety
 - **`TestParseRetryAfter`** — Retry-After header parsing (integers, zero, negative, garbage, RFC 1123 dates)
 - **`TestShouldProcess`** — file filter logic (include/exclude globs, size bounds, combined filters)
-- **`TestRun*`** — end-to-end tests for `run()`: flag validation (version, no args, missing API key, invalid output/patterns/sizes/algo), hash lookups (clean, malicious, MD5), single file scanning (default SHA-256, SHA-1, size filters), directory scanning (flat, recursive, JSON, include/exclude)
+- **`TestCountMatchingFiles`** — pre-walk file counting (no filters, include filter, exclude filter)
+- **`TestCountMatchingFilesRecursive`** — non-recursive vs recursive counting
+- **`TestCountMatchingFilesSkipDirs`** — `.git` directory is skipped during count
+- **`TestRun*`** — end-to-end tests for `run()`: flag validation (version, no args, missing API key, invalid output/patterns/sizes/algo), hash lookups (clean, malicious, MD5), single file scanning (default SHA-256, SHA-1, size filters), directory scanning (flat, recursive, JSON, include/exclude, no-progress)
 
 **`virustotal_test.go`** — httptest-based integration tests:
 - **`TestCheckVirusTotal`** — HTTP client against a mock server (200 success, clean file, 404 not found, 429 retry, 429 exhausted, 403 bad key, bad JSON, context cancellation)
@@ -386,6 +397,8 @@ go test -cover ./...
 |---------|---------|
 | [`github.com/dustin/go-humanize`](https://github.com/dustin/go-humanize) | Parse human-readable file sizes (`"10MB"` to bytes) |
 | [`github.com/fatih/color`](https://github.com/fatih/color) | ANSI-colored terminal output |
+| [`github.com/mattn/go-isatty`](https://github.com/mattn/go-isatty) | Detect whether a file descriptor is a terminal (TTY) |
+| [`github.com/schollz/progressbar/v3`](https://github.com/schollz/progressbar) | Terminal progress bar with ETA and throughput display |
 | [`golang.org/x/time/rate`](https://pkg.go.dev/golang.org/x/time/rate) | Token-bucket rate limiter for API call pacing |
 
 ## License

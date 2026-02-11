@@ -29,9 +29,11 @@ import (
 	"strings"       // string utilities — TrimSpace, ToLower
 	"time"          // durations for rate limiting and cache expiry
 
-	"github.com/dustin/go-humanize" // third-party library for parsing human-readable sizes (e.g. "10MB" → bytes)
-	"github.com/fatih/color"        // third-party library for ANSI-colored terminal output
-	"golang.org/x/time/rate"        // token bucket rate limiter for API call pacing
+	"github.com/dustin/go-humanize"         // third-party library for parsing human-readable sizes (e.g. "10MB" → bytes)
+	"github.com/fatih/color"                // third-party library for ANSI-colored terminal output
+	"github.com/mattn/go-isatty"            // detect whether a file descriptor is a terminal (TTY)
+	"github.com/schollz/progressbar/v3"     // terminal progress bar with ETA and throughput display
+	"golang.org/x/time/rate"                // token bucket rate limiter for API call pacing
 )
 
 // version identifies the build of hashchecker. This is printed via the
@@ -82,6 +84,7 @@ func run() int {
 	output := flag.String("o", "text", "output format: text or json")
 	noColor := flag.Bool("no-color", false, "disable colored output")
 	noCache := flag.Bool("no-cache", false, "disable cache (don't read or write)")
+	noProgress := flag.Bool("no-progress", false, "disable progress bar for directory scans")
 	refresh := flag.Bool("refresh", false, "ignore cached results but still write new ones")
 	cacheAge := flag.Int("cache-age", 7, "maximum age of cached results in days")
 	recursive := flag.Bool("r", false, "recursively scan subdirectories")
@@ -247,6 +250,19 @@ func run() int {
 		color.NoColor = true
 	}
 
+	// ── Progress Bar Decision ───────────────────────────────────────
+	//
+	// Show a progress bar for directory scans when:
+	//   1. Output is text (not JSON — JSON consumers parse stdout)
+	//   2. User hasn't explicitly disabled it with -no-progress
+	//   3. Stderr is a real terminal (not piped or redirected)
+	//
+	// Why stderr? The bar writes to stderr so that piping stdout
+	// (e.g. hashchecker -r dir > results.txt) still shows progress
+	// on the terminal. isatty checks whether stderr is a TTY.
+	showProgress := *output == "text" && !*noProgress &&
+		isatty.IsTerminal(os.Stderr.Fd())
+
 	// ── Rate Limiter Setup ──────────────────────────────────────────
 	//
 	// Resolve the effective rate from -free and --rate flags.
@@ -387,7 +403,7 @@ func run() int {
 		return 1
 	}
 	if fi.IsDir() {
-		return runDir(arg, cfg, sc)
+		return runDir(arg, cfg, sc, showProgress)
 	}
 	return runFile(arg, fi, cfg, sc)
 }
@@ -417,8 +433,40 @@ func runHash(arg string, cfg lookupConfig) int {
 // runDir handles the case where the user passes a directory path.
 // It walks the directory tree (optionally recursive), hashes each
 // matching file, looks it up on VirusTotal, and prints a summary.
-func runDir(arg string, cfg lookupConfig, sc scanConfig) int {
+//
+// When showProgress is true, a pre-walk counts matching files so
+// we can display a determinate progress bar with percentage and ETA.
+func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int {
 	var looked, found, malicious int
+
+	// ── Progress Bar Setup ──────────────────────────────────────────
+	//
+	// Pre-walk the directory to count matching files. This is fast
+	// (no hashing or API calls) and gives us a total for the bar.
+	var bar *progressbar.ProgressBar
+	if showProgress {
+		total, err := countMatchingFiles(arg, sc)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Warning: could not count files:", err)
+		} else if total > 0 {
+			bar = progressbar.NewOptions(total,
+				progressbar.OptionSetWriter(os.Stderr),
+				progressbar.OptionSetDescription("Scanning"),
+				progressbar.OptionShowCount(),
+				progressbar.OptionShowIts(),
+				progressbar.OptionSetItsString("files"),
+				progressbar.OptionClearOnFinish(),
+				progressbar.OptionSetPredictTime(true),
+				progressbar.OptionSetTheme(progressbar.Theme{
+					Saucer:        "=",
+					SaucerHead:    ">",
+					SaucerPadding: " ",
+					BarStart:      "[",
+					BarEnd:        "]",
+				}),
+			)
+		}
+	}
 
 	err := filepath.WalkDir(arg, func(path string, d fs.DirEntry, err error) error {
 		if cfg.ctx.Err() != nil {
@@ -478,8 +526,16 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig) int {
 				malicious++
 			}
 		}
+
+		if bar != nil {
+			bar.Add(1)
+		}
 		return nil
 	})
+	if bar != nil {
+		bar.Finish()
+	}
+
 	if err != nil {
 		if cfg.ctx.Err() != nil {
 			fmt.Fprintln(os.Stderr, "\nInterrupted")
@@ -506,6 +562,44 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig) int {
 		return 2
 	}
 	return 0
+}
+
+// countMatchingFiles does a fast pre-walk of the directory tree using
+// the same dir-skip and shouldProcess() filter logic as runDir, but
+// only counts files — no hashing or API calls. This gives us a total
+// for the progress bar so it can show percentage and ETA.
+//
+// Even for thousands of files, this completes in milliseconds because
+// it only reads directory entries and (when size filters are active)
+// file metadata — no file contents are read.
+func countMatchingFiles(root string, sc scanConfig) (int, error) {
+	count := 0
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip inaccessible entries
+		}
+		if d.IsDir() {
+			if path != root {
+				if skipDirs[d.Name()] {
+					return fs.SkipDir
+				}
+				if !sc.recursive {
+					return fs.SkipDir
+				}
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		ok, filterErr := shouldProcess(d, sc.includes, sc.excludes, sc.minSize, sc.maxSize)
+		if filterErr != nil || !ok {
+			return nil
+		}
+		count++
+		return nil
+	})
+	return count, err
 }
 
 // runFile handles the case where the user passes a path to a single file.

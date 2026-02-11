@@ -835,3 +835,129 @@ func TestRunDirectoryWithIncludeExclude(t *testing.T) {
 	}
 }
 
+// ── countMatchingFiles tests ─────────────────────────────────────────
+
+func TestCountMatchingFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.exe"), []byte("bbb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "c.log"), []byte("ccc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("no filters counts all files", func(t *testing.T) {
+		sc := scanConfig{}
+		got, err := countMatchingFiles(dir, sc)
+		if err != nil {
+			t.Fatalf("countMatchingFiles() error: %v", err)
+		}
+		if got != 3 {
+			t.Fatalf("countMatchingFiles() = %d, want 3", got)
+		}
+	})
+
+	t.Run("include filter", func(t *testing.T) {
+		sc := scanConfig{includes: []string{"*.exe"}}
+		got, err := countMatchingFiles(dir, sc)
+		if err != nil {
+			t.Fatalf("countMatchingFiles() error: %v", err)
+		}
+		if got != 1 {
+			t.Fatalf("countMatchingFiles() = %d, want 1", got)
+		}
+	})
+
+	t.Run("exclude filter", func(t *testing.T) {
+		sc := scanConfig{excludes: []string{"*.log"}}
+		got, err := countMatchingFiles(dir, sc)
+		if err != nil {
+			t.Fatalf("countMatchingFiles() error: %v", err)
+		}
+		if got != 2 {
+			t.Fatalf("countMatchingFiles() = %d, want 2", got)
+		}
+	})
+}
+
+func TestCountMatchingFilesRecursive(t *testing.T) {
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "root.txt"), []byte("r"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "nested.txt"), []byte("n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("non-recursive counts only root", func(t *testing.T) {
+		sc := scanConfig{recursive: false}
+		got, err := countMatchingFiles(dir, sc)
+		if err != nil {
+			t.Fatalf("countMatchingFiles() error: %v", err)
+		}
+		if got != 1 {
+			t.Fatalf("countMatchingFiles() = %d, want 1", got)
+		}
+	})
+
+	t.Run("recursive counts all", func(t *testing.T) {
+		sc := scanConfig{recursive: true}
+		got, err := countMatchingFiles(dir, sc)
+		if err != nil {
+			t.Fatalf("countMatchingFiles() error: %v", err)
+		}
+		if got != 2 {
+			t.Fatalf("countMatchingFiles() = %d, want 2", got)
+		}
+	})
+}
+
+func TestCountMatchingFilesSkipDirs(t *testing.T) {
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("k"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// This file is inside .git and should be skipped
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sc := scanConfig{recursive: true}
+	got, err := countMatchingFiles(dir, sc)
+	if err != nil {
+		t.Fatalf("countMatchingFiles() error: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("countMatchingFiles() = %d, want 1 (.git should be skipped)", got)
+	}
+}
+
+func TestRunDirectoryWithNoProgress(t *testing.T) {
+	srv := startMockVT(t)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout := callRun(t, "-no-cache", "-no-progress", dir)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "Checked") || !strings.Contains(stdout, "files") {
+		t.Fatalf("expected summary line, got %q", stdout)
+	}
+}
+
