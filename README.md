@@ -14,6 +14,7 @@ A command-line tool that computes SHA-256 hashes of files and checks them agains
 - **JSON output** — use `-o json` for NDJSON (one JSON object per line), suitable for piping into `jq` or other tools.
 - **Result caching** — caches VirusTotal results locally (`~/.cache/hashchecker/results.json`) to avoid redundant API calls. Cached results expire after 7 days by default. Control with `-no-cache`, `-refresh`, and `-cache-age`. Cache writes are atomic (write to temp file, then rename) to prevent corruption.
 - **Graceful cancellation** — press Ctrl+C to cleanly interrupt long-running scans. In-flight rate-limit waits, HTTP requests, and directory walks exit immediately, and the cache is flushed before shutdown.
+- **Contextual error messages** — every error is wrapped with `fmt.Errorf("context: %w", err)` so messages tell you *what operation* failed and *which file or hash* was involved (e.g. `"hashing /tmp/foo: permission denied"` instead of a bare `"permission denied"`). Error chains are preserved via `%w`, so `errors.Is` and `errors.As` still work for programmatic error inspection.
 - **Scriptable exit codes** — exit 0 for clean, 1 for errors, 2 when malicious files are detected.
 
 ## Prerequisites
@@ -267,6 +268,26 @@ To change the cache expiry (e.g., 1 day):
 
 ```bash
 hashchecker -cache-age 1 /path/to/file
+```
+
+## Error handling
+
+All errors are wrapped with contextual information using Go's `fmt.Errorf("context: %w", err)` pattern. This means:
+
+1. **Every error message tells you what went wrong and where.** Instead of a bare `permission denied`, you'll see `hashing /tmp/foo: permission denied` or `opening cache /home/user/.cache/hashchecker/results.json: permission denied`.
+
+2. **The error chain is preserved.** The `%w` verb (not `%v`) ensures that `errors.Is(err, os.ErrPermission)` still works on wrapped errors, so programmatic error handling remains reliable.
+
+3. **No double-wrapping.** Each function adds only the context it owns. For example, `checkVirusTotal` adds the hash (`"checking virustotal abc123: ..."`), so its caller `lookupAndPrint` does not re-wrap with the same hash.
+
+Example error messages:
+
+```
+Error: hashing /tmp/secret.bin: open /tmp/secret.bin: permission denied
+Error: checking virustotal abc123...: unexpected status: 403: {"error": ...}
+Error: checking virustotal abc123...: rate limited after 3 retries
+Error: locating cache directory: $HOME is not defined
+Error: writing cache: write /tmp/results.json.tmp: no space left on device
 ```
 
 ## Project structure
