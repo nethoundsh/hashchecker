@@ -528,12 +528,12 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 		}
 
 		if bar != nil {
-			bar.Add(1)
+			_ = bar.Add(1)
 		}
 		return nil
 	})
 	if bar != nil {
-		bar.Finish()
+		_ = bar.Finish()
 	}
 
 	if err != nil {

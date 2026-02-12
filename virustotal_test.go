@@ -206,7 +206,7 @@ func TestCheckVirusTotalSendsAPIKey(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	checkVirusTotal(context.Background(), srv.Client(), "my-secret-key", "abc123", srv.URL+"/")
+	_, _ = checkVirusTotal(context.Background(), srv.Client(), "my-secret-key", "abc123", srv.URL+"/")
 	if gotKey != "my-secret-key" {
 		t.Fatalf("x-apikey header = %q, want %q", gotKey, "my-secret-key")
 	}
@@ -353,7 +353,7 @@ func TestWaitForRateLimit(t *testing.T) {
 		// Slow limiter that will block — combined with cancelled context
 		limiter := rate.NewLimiter(rate.Every(time.Hour), 1)
 		// Drain the single burst token
-		limiter.Wait(context.Background())
+		_ = limiter.Wait(context.Background())
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()

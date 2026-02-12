@@ -326,6 +326,7 @@ hashchecker/
   output_test.go                 Output formatting and color helper tests
   cache_test.go                  Filesystem tests for cache load/save/round-trip
   go.mod                         Module definition and dependencies
+  LICENSE                        MIT license
   .github/workflows/ci.yml      GitHub Actions CI: golangci-lint + tests on push/PR
 ```
 
