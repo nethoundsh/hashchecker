@@ -18,6 +18,18 @@ A command-line tool that computes file hashes and checks them against the [Virus
 - **Contextual error messages** — every error is wrapped with `fmt.Errorf("context: %w", err)` so messages tell you *what operation* failed and *which file or hash* was involved (e.g. `"hashing /tmp/foo: permission denied"` instead of a bare `"permission denied"`). Error chains are preserved via `%w`, so `errors.Is` and `errors.As` still work for programmatic error inspection.
 - **Scriptable exit codes** — exit 0 for clean, 1 for errors, 2 when malicious files are detected.
 
+## Use Cases
+
+- **SOC Triage** — When your security operations center receives an alert, analysts can instantly check whether a suspicious file is known malware by scanning it against 70+ antivirus engines via VirusTotal. Batch-scan an entire quarantine folder in one command and get a clear malicious/clean verdict for each file, cutting triage time from minutes to seconds.
+
+- **Ransomware Recovery** — During incident response, quickly assess which files on a compromised system are known malicious. Sweep entire directories recursively to identify the ransomware payload, its droppers, and any other known threats — helping your IR team determine scope of compromise and prioritize remediation.
+
+- **Supply Chain Verification** — Before deploying third-party binaries, scripts, or vendor-provided software into production, verify that no component is flagged by any of VirusTotal's detection engines. Integrate into your deployment pipeline with JSON output and scriptable exit codes (exit 2 = malicious detected).
+
+- **Threat Hunting** — Proactively scan file servers, shared drives, or developer workstations for known indicators of compromise (IOCs). Use file filtering to focus on high-risk file types (executables, DLLs, scripts) and size ranges that match known threat profiles.
+
+- **Compliance & Audit** — Generate machine-readable JSON reports of file integrity checks across critical systems. The NDJSON output integrates directly with SIEM platforms, log aggregators, and compliance reporting tools.
+
 ## Prerequisites
 
 - **Go 1.25.7+** (or any recent Go toolchain)
