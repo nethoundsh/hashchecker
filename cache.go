@@ -75,7 +75,7 @@ func saveCache(path string, cache map[string]cacheEntry) error {
 		return fmt.Errorf("writing cache: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp) // best-effort cleanup
+		_ = os.Remove(tmp) // best-effort cleanup
 		return fmt.Errorf("committing cache file: %w", err)
 	}
 	return nil

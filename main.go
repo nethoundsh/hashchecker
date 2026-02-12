@@ -192,7 +192,7 @@ func parseConfig() (appConfig, error) {
 	if *minSizeStr != "" {
 		bytes, err := humanize.ParseBytes(*minSizeStr)
 		if err != nil {
-			return appConfig{}, fmt.Errorf("invalid -min-size value %q: %v", *minSizeStr, err)
+			return appConfig{}, fmt.Errorf("invalid -min-size value %q: %w", *minSizeStr, err)
 		}
 		minSize = int64(bytes)
 	}
@@ -200,7 +200,7 @@ func parseConfig() (appConfig, error) {
 	if *maxSizeStr != "" {
 		bytes, err := humanize.ParseBytes(*maxSizeStr)
 		if err != nil {
-			return appConfig{}, fmt.Errorf("invalid -max-size value %q: %v", *maxSizeStr, err)
+			return appConfig{}, fmt.Errorf("invalid -max-size value %q: %w", *maxSizeStr, err)
 		}
 		maxSize = int64(bytes)
 	}

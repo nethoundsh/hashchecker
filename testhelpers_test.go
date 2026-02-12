@@ -29,7 +29,9 @@ func captureStdout(t *testing.T, fn func()) string {
 
 	os.Stdout = w
 	fn()
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("closing stdout pipe: %v", err)
+	}
 
 	out, err := io.ReadAll(r)
 	if err != nil {

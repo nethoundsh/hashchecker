@@ -58,7 +58,7 @@ func TestCheckVirusTotal(t *testing.T) {
 			name: "200 success with malicious",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(200)
-				fmt.Fprint(w, vtJSON("malware.exe", -5, 42, 3, 10, 50, "trojan.generic"))
+				_, _ = fmt.Fprint(w, vtJSON("malware.exe", -5, 42, 3, 10, 50, "trojan.generic"))
 			},
 			wantFound: true,
 			wantMal:   42,
@@ -67,7 +67,7 @@ func TestCheckVirusTotal(t *testing.T) {
 			name: "200 clean file",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(200)
-				fmt.Fprint(w, vtJSON("clean.pdf", 0, 0, 0, 5, 60, ""))
+				_, _ = fmt.Fprint(w, vtJSON("clean.pdf", 0, 0, 0, 5, 60, ""))
 			},
 			wantFound: true,
 			wantMal:   0,
@@ -76,7 +76,7 @@ func TestCheckVirusTotal(t *testing.T) {
 			name: "404 not found",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(404)
-				fmt.Fprint(w, `{"error":{"code":"NotFoundError"}}`)
+				_, _ = fmt.Fprint(w, `{"error":{"code":"NotFoundError"}}`)
 			},
 			wantFound: false,
 		},
@@ -91,7 +91,7 @@ func TestCheckVirusTotal(t *testing.T) {
 						return
 					}
 					w.WriteHeader(200)
-					fmt.Fprint(w, vtJSON("retried.exe", 0, 1, 0, 0, 60, ""))
+					_, _ = fmt.Fprint(w, vtJSON("retried.exe", 0, 1, 0, 0, 60, ""))
 				}
 			}(),
 			wantFound: true,
@@ -109,7 +109,7 @@ func TestCheckVirusTotal(t *testing.T) {
 			name: "403 bad key",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(403)
-				fmt.Fprint(w, `{"error":{"code":"ForbiddenError","message":"Wrong API key"}}`)
+				_, _ = fmt.Fprint(w, `{"error":{"code":"ForbiddenError","message":"Wrong API key"}}`)
 			},
 			wantErr: "unexpected status: 403",
 		},
@@ -117,7 +117,7 @@ func TestCheckVirusTotal(t *testing.T) {
 			name: "200 bad JSON",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(200)
-				fmt.Fprint(w, `{not valid json}`)
+				_, _ = fmt.Fprint(w, `{not valid json}`)
 			},
 			wantErr: "parsing response",
 		},
@@ -248,7 +248,7 @@ func TestLookup(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				apiCalls.Add(1)
 				w.WriteHeader(200)
-				fmt.Fprint(w, vtJSON("cached-file.exe", 0, 5, 0, 2, 55, ""))
+				_, _ = fmt.Fprint(w, vtJSON("cached-file.exe", 0, 5, 0, 2, 55, ""))
 			}))
 			defer srv.Close()
 

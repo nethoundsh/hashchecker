@@ -593,7 +593,7 @@ func startMockVT(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		fmt.Fprint(w, `{
+		_, _ = fmt.Fprint(w, `{
 			"data": {
 				"attributes": {
 					"meaningful_name": "test.exe",
@@ -635,7 +635,7 @@ func TestRunHashLookupMalicious(t *testing.T) {
 	// Mock server returns malicious > 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		fmt.Fprint(w, `{
+		_, _ = fmt.Fprint(w, `{
 			"data": {
 				"attributes": {
 					"meaningful_name": "evil.exe",

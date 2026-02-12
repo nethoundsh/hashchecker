@@ -140,7 +140,7 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, bas
 
 		// Explicit Close() instead of defer — we're in a loop.
 		body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-		response.Body.Close()
+		_ = response.Body.Close()
 		if err != nil {
 			return VirusTotalResult{}, fmt.Errorf("reading virustotal response for %s: %w", hash, err)
 		}
