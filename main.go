@@ -144,6 +144,16 @@ func parseConfig() (appConfig, error) {
 	// Cancelled on Ctrl+C so long-running operations exit cleanly.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 
+	// If parseConfig returns an error, stop() must be called to
+	// unregister the signal handler. On success, ownership of stop()
+	// transfers to the caller via appConfig.stop.
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			stop()
+		}
+	}()
+
 	parsePatterns := func(s string) []string {
 		if s == "" {
 			return nil
@@ -171,11 +181,9 @@ func parseConfig() (appConfig, error) {
 		return nil
 	}
 	if err := validatePatterns("-include", includes); err != nil {
-		stop()
 		return appConfig{}, err
 	}
 	if err := validatePatterns("-exclude", excludes); err != nil {
-		stop()
 		return appConfig{}, err
 	}
 
@@ -184,7 +192,6 @@ func parseConfig() (appConfig, error) {
 	if *minSizeStr != "" {
 		bytes, err := humanize.ParseBytes(*minSizeStr)
 		if err != nil {
-			stop()
 			return appConfig{}, fmt.Errorf("invalid -min-size value %q: %v", *minSizeStr, err)
 		}
 		minSize = int64(bytes)
@@ -193,14 +200,12 @@ func parseConfig() (appConfig, error) {
 	if *maxSizeStr != "" {
 		bytes, err := humanize.ParseBytes(*maxSizeStr)
 		if err != nil {
-			stop()
 			return appConfig{}, fmt.Errorf("invalid -max-size value %q: %v", *maxSizeStr, err)
 		}
 		maxSize = int64(bytes)
 	}
 
 	if minSize > 0 && maxSize > 0 && minSize > maxSize {
-		stop()
 		return appConfig{}, fmt.Errorf("-min-size (%s) cannot be greater than -max-size (%s)",
 			*minSizeStr, *maxSizeStr)
 	}
@@ -208,14 +213,12 @@ func parseConfig() (appConfig, error) {
 	switch *output {
 	case "text", "json":
 	default:
-		stop()
 		return appConfig{}, fmt.Errorf("invalid -o value; must be 'text' or 'json'")
 	}
 
 	switch *algo {
 	case "sha256", "sha1", "md5":
 	default:
-		stop()
 		return appConfig{}, fmt.Errorf("invalid -algo value; must be 'sha256', 'sha1', or 'md5'")
 	}
 
@@ -240,7 +243,6 @@ func parseConfig() (appConfig, error) {
 	}
 
 	if flag.NArg() < 1 {
-		stop()
 		return appConfig{}, errUsage
 	}
 
@@ -276,12 +278,12 @@ func parseConfig() (appConfig, error) {
 
 	apiKey := strings.TrimSpace(os.Getenv("VIRUSTOTAL_API_KEY"))
 	if apiKey == "" {
-		stop()
 		return appConfig{}, fmt.Errorf("VIRUSTOTAL_API_KEY is not set")
 	}
 
 	arg := flag.Arg(0)
 
+	succeeded = true
 	return appConfig{
 		lookupCfg: lookupConfig{
 			ctx:          ctx,
