@@ -32,36 +32,41 @@ A command-line tool that computes file hashes and checks them against the [Virus
 
 ## Prerequisites
 
-- **Go 1.25.7+** (or any recent Go toolchain)
 - A **VirusTotal API key** — sign up for a free account at [virustotal.com](https://www.virustotal.com/) and copy your API key from the API section of your profile.
 
 ## Installation
 
+### Pre-built binaries (recommended)
+
+Download the latest release for your platform from the [Releases page](https://github.com/nethoundsh/hashchecker/releases). Binaries are available for Linux, macOS, and Windows on both amd64 and arm64. Each release includes a `checksums.txt` for integrity verification.
+
 ```bash
-git clone https://github.com/nethoundsh/hashchecker.git
-cd hashchecker
-go build -o hashchecker .
+# Example: Linux amd64
+curl -LO https://github.com/nethoundsh/hashchecker/releases/latest/download/hashchecker_linux_amd64.tar.gz
+tar xzf hashchecker_linux_amd64.tar.gz
+sudo mv hashchecker /usr/local/bin/
 ```
 
-Or install directly:
+Verify the download:
+
+```bash
+hashchecker -version
+```
+
+### Build from source
+
+Requires **Go 1.25.7+**:
 
 ```bash
 go install github.com/nethoundsh/hashchecker@latest
 ```
 
-### Build with version info
-
-Embed a version string at build time using `-ldflags`:
+Or clone and build manually:
 
 ```bash
-go build -ldflags "-X main.version=v1.0.0" -o hashchecker .
-```
-
-Then check it with:
-
-```bash
-hashchecker -version
-# hashchecker v1.0.0
+git clone https://github.com/nethoundsh/hashchecker.git
+cd hashchecker
+go build -o hashchecker .
 ```
 
 ## Configuration
@@ -328,30 +333,40 @@ Error: writing cache: write /tmp/results.json.tmp: no space left on device
 
 ```
 hashchecker/
-  main.go                        Entry point, parseConfig(), run() dispatch, helpers (runHash, runDir, runFile), hashing
-  virustotal.go                  VirusTotal API client, lookup(), result types, rate limiting, retry logic
-  output.go                      Text and JSON output formatting, printLookupResult(), color helpers
-  cache.go                       Disk cache: load, save (atomic), expiry
-  filter.go                      File filtering by glob pattern and size
-  main_test.go                   Tests for run(), hashing, filters, retry parsing
-  virustotal_test.go             httptest integration tests for API client, caching, rate limiting
-  output_test.go                 Output formatting and color helper tests
-  cache_test.go                  Filesystem tests for cache load/save/round-trip
-  go.mod                         Module definition and dependencies
-  LICENSE                        MIT license
-  .github/workflows/ci.yml      GitHub Actions CI: golangci-lint + tests on push/PR
+  main.go                          Entry point, parseConfig(), run() dispatch, helpers (runHash, runDir, runFile), hashing
+  virustotal.go                    VirusTotal API client, lookup(), result types, rate limiting, retry logic
+  output.go                        Text and JSON output formatting, printLookupResult(), color helpers
+  cache.go                         Disk cache: load, save (atomic), expiry
+  filter.go                        File filtering by glob pattern and size
+  main_test.go                     Tests for run(), hashing, filters, retry parsing
+  virustotal_test.go               httptest integration tests for API client, caching, rate limiting
+  output_test.go                   Output formatting and color helper tests
+  cache_test.go                    Filesystem tests for cache load/save/round-trip
+  testhelpers_test.go              Shared test utilities (stdout capture)
+  go.mod                           Module definition and dependencies
+  .golangci.yml                    Linter configuration (golangci-lint v2)
+  .goreleaser.yml                  Cross-platform release build configuration
+  .github/workflows/ci.yml        GitHub Actions CI: golangci-lint + tests on push/PR
+  .github/workflows/release.yml   Automated releases: builds binaries + checksums on tag push
+  LICENSE                          MIT license
 ```
 
-## CI
+## CI / CD
 
 Every push to `main` and every pull request runs two GitHub Actions jobs automatically:
 
 | Job | What it does |
 |-----|--------------|
-| **Lint** | Runs [golangci-lint](https://golangci-lint.run/) to enforce `gofmt` formatting, `go vet` diagnostics, and a broad set of static-analysis checks (unused code, error handling, shadowed variables, etc.) |
+| **Lint** | Runs [golangci-lint v2](https://golangci-lint.run/) with errcheck, govet, staticcheck, gosec, errorlint, and bodyclose |
 | **Test** | Runs `go build`, `go vet`, and `go test -race -cover` to catch regressions and data races |
 
-The workflow is defined in [`.github/workflows/ci.yml`](.github/workflows/ci.yml). The Go version is read from `go.mod` so it stays in sync automatically.
+Pushing a version tag (e.g. `v1.2.0`) triggers an automated release via [GoReleaser](https://goreleaser.com/):
+
+| Job | What it does |
+|-----|--------------|
+| **Release** | Builds cross-platform binaries (Linux, macOS, Windows — amd64 and arm64), generates SHA-256 checksums, and publishes a GitHub Release with all assets attached |
+
+Workflows are defined in [`.github/workflows/`](.github/workflows/). The Go version is read from `go.mod` so it stays in sync automatically.
 
 ## Running tests
 
@@ -367,10 +382,7 @@ The test suite has **123 tests** (including subtests) across 4 test files with *
 - **`TestTruncateRunes`** — string truncation with multi-byte character safety
 - **`TestParseRetryAfter`** — Retry-After header parsing (integers, zero, negative, garbage, RFC 1123 dates)
 - **`TestShouldProcess`** — file filter logic (include/exclude globs, size bounds, combined filters)
-- **`TestCountMatchingFiles`** — pre-walk file counting (no filters, include filter, exclude filter)
-- **`TestCountMatchingFilesRecursive`** — non-recursive vs recursive counting
-- **`TestCountMatchingFilesSkipDirs`** — `.git` directory is skipped during count
-- **`TestRun*`** — end-to-end tests for `run()`: flag validation (version, no args, missing API key, invalid output/patterns/sizes/algo), hash lookups (clean, malicious, MD5), single file scanning (default SHA-256, SHA-1, size filters), directory scanning (flat, recursive, JSON, include/exclude, no-progress)
+- **`TestRun*`** — end-to-end tests for `run()`: flag validation (version, no args, missing API key, invalid output/patterns/sizes/algo), hash lookups (clean, malicious, MD5), single file scanning (default SHA-256, SHA-1, size filters), directory scanning (flat, recursive, JSON, include/exclude)
 
 **`virustotal_test.go`** — httptest-based integration tests:
 - **`TestCheckVirusTotal`** — HTTP client against a mock server (200 success, clean file, 404 not found, 429 retry, 429 exhausted, 403 bad key, bad JSON, context cancellation)
