@@ -3,10 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -14,31 +12,6 @@ import (
 
 	"golang.org/x/time/rate"
 )
-
-// captureStdout redirects os.Stdout to a pipe, runs fn, and returns
-// the captured output as a string. This is needed because lookupAndPrint
-// calls printJSON/printResult which write to os.Stdout.
-func captureStdout(t *testing.T, fn func()) string {
-	t.Helper()
-
-	old := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
-	}
-	os.Stdout = w
-
-	fn()
-
-	w.Close()
-	os.Stdout = old
-
-	out, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("reading pipe: %v", err)
-	}
-	return string(out)
-}
 
 // vtJSON returns a valid VirusTotal API v3 JSON response body with
 // the given analysis stats. This avoids duplicating the nested JSON
@@ -212,24 +185,21 @@ func TestCheckVirusTotalSendsAPIKey(t *testing.T) {
 	}
 }
 
-func TestLookupAndPrint(t *testing.T) {
+func TestLookup(t *testing.T) {
 	const testHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 	tests := []struct {
-		name       string
-		cache      map[string]cacheEntry
-		refresh    bool
-		output     string
+		name         string
+		cache        map[string]cacheEntry
+		refresh      bool
 		wantAPICalls int32
-		wantFound  bool
-		wantSubstr string // substring expected in stdout
+		wantFound    bool
 	}{
 		{
 			name:         "cache miss calls API",
 			cache:        make(map[string]cacheEntry),
 			wantAPICalls: 1,
 			wantFound:    true,
-			wantSubstr:   "cached-file.exe",
 		},
 		{
 			name: "cache hit skips API",
@@ -243,7 +213,6 @@ func TestLookupAndPrint(t *testing.T) {
 			},
 			wantAPICalls: 0,
 			wantFound:    true,
-			wantSubstr:   "from-cache.exe",
 		},
 		{
 			name: "expired cache calls API",
@@ -252,12 +221,11 @@ func TestLookupAndPrint(t *testing.T) {
 					Result: VirusTotalResult{
 						Found: true, Name: "old-cache.exe",
 					},
-					Timestamp: time.Now().Add(-30 * 24 * time.Hour), // 30 days old
+					Timestamp: time.Now().Add(-30 * 24 * time.Hour),
 				},
 			},
 			wantAPICalls: 1,
 			wantFound:    true,
-			wantSubstr:   "cached-file.exe", // from API, not cache
 		},
 		{
 			name: "refresh bypasses cache",
@@ -270,15 +238,6 @@ func TestLookupAndPrint(t *testing.T) {
 			refresh:      true,
 			wantAPICalls: 1,
 			wantFound:    true,
-			wantSubstr:   "cached-file.exe", // from API
-		},
-		{
-			name:         "json output",
-			cache:        make(map[string]cacheEntry),
-			output:       "json",
-			wantAPICalls: 1,
-			wantFound:    true,
-			wantSubstr:   `"found":true`,
 		},
 	}
 
@@ -292,16 +251,11 @@ func TestLookupAndPrint(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			outputMode := tt.output
-			if outputMode == "" {
-				outputMode = "text"
-			}
-
 			cfg := lookupConfig{
 				ctx:          context.Background(),
 				client:       srv.Client(),
 				apiKey:       "test-key",
-				output:       outputMode,
+				output:       "text",
 				algo:         "sha256",
 				cache:        tt.cache,
 				refresh:      tt.refresh,
@@ -310,12 +264,7 @@ func TestLookupAndPrint(t *testing.T) {
 				baseURL:      srv.URL + "/",
 			}
 
-			var result VirusTotalResult
-			var err error
-			stdout := captureStdout(t, func() {
-				result, err = lookupAndPrint("", testHash, cfg)
-			})
-
+			result, err := lookup(testHash, cfg)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -324,9 +273,6 @@ func TestLookupAndPrint(t *testing.T) {
 			}
 			if got := apiCalls.Load(); got != tt.wantAPICalls {
 				t.Fatalf("API calls = %d, want %d", got, tt.wantAPICalls)
-			}
-			if tt.wantSubstr != "" && !strings.Contains(stdout, tt.wantSubstr) {
-				t.Fatalf("stdout %q does not contain %q", stdout, tt.wantSubstr)
 			}
 		})
 	}

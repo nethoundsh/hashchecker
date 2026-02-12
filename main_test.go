@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -452,6 +453,30 @@ func TestShouldProcess(t *testing.T) {
 	}
 }
 
+// captureStdout redirects os.Stdout to a pipe, runs fn, and returns
+// the captured output as a string.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+
+	fn()
+
+	w.Close()
+	os.Stdout = old
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("reading pipe: %v", err)
+	}
+	return string(out)
+}
+
 // callRun resets the global flag state, sets os.Args, and calls run().
 // This lets us test run()'s early validation paths without making real
 // API calls. The flag.CommandLine reset is necessary because Go's flag
@@ -837,7 +862,7 @@ func TestRunDirectoryWithIncludeExclude(t *testing.T) {
 
 // ── countMatchingFiles tests ─────────────────────────────────────────
 
-func TestCountMatchingFiles(t *testing.T) {
+func TestCollectMatchingFiles(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("aaa"), 0o644); err != nil {
 		t.Fatal(err)
@@ -851,39 +876,39 @@ func TestCountMatchingFiles(t *testing.T) {
 
 	t.Run("no filters counts all files", func(t *testing.T) {
 		sc := scanConfig{}
-		got, err := countMatchingFiles(dir, sc)
+		got, err := collectMatchingFiles(dir, sc)
 		if err != nil {
-			t.Fatalf("countMatchingFiles() error: %v", err)
+			t.Fatalf("collectMatchingFiles() error: %v", err)
 		}
-		if got != 3 {
-			t.Fatalf("countMatchingFiles() = %d, want 3", got)
+		if len(got) != 3 {
+			t.Fatalf("collectMatchingFiles() returned %d files, want 3", len(got))
 		}
 	})
 
 	t.Run("include filter", func(t *testing.T) {
 		sc := scanConfig{includes: []string{"*.exe"}}
-		got, err := countMatchingFiles(dir, sc)
+		got, err := collectMatchingFiles(dir, sc)
 		if err != nil {
-			t.Fatalf("countMatchingFiles() error: %v", err)
+			t.Fatalf("collectMatchingFiles() error: %v", err)
 		}
-		if got != 1 {
-			t.Fatalf("countMatchingFiles() = %d, want 1", got)
+		if len(got) != 1 {
+			t.Fatalf("collectMatchingFiles() returned %d files, want 1", len(got))
 		}
 	})
 
 	t.Run("exclude filter", func(t *testing.T) {
 		sc := scanConfig{excludes: []string{"*.log"}}
-		got, err := countMatchingFiles(dir, sc)
+		got, err := collectMatchingFiles(dir, sc)
 		if err != nil {
-			t.Fatalf("countMatchingFiles() error: %v", err)
+			t.Fatalf("collectMatchingFiles() error: %v", err)
 		}
-		if got != 2 {
-			t.Fatalf("countMatchingFiles() = %d, want 2", got)
+		if len(got) != 2 {
+			t.Fatalf("collectMatchingFiles() returned %d files, want 2", len(got))
 		}
 	})
 }
 
-func TestCountMatchingFilesRecursive(t *testing.T) {
+func TestCollectMatchingFilesRecursive(t *testing.T) {
 	dir := t.TempDir()
 	subdir := filepath.Join(dir, "sub")
 	if err := os.MkdirAll(subdir, 0o755); err != nil {
@@ -898,28 +923,28 @@ func TestCountMatchingFilesRecursive(t *testing.T) {
 
 	t.Run("non-recursive counts only root", func(t *testing.T) {
 		sc := scanConfig{recursive: false}
-		got, err := countMatchingFiles(dir, sc)
+		got, err := collectMatchingFiles(dir, sc)
 		if err != nil {
-			t.Fatalf("countMatchingFiles() error: %v", err)
+			t.Fatalf("collectMatchingFiles() error: %v", err)
 		}
-		if got != 1 {
-			t.Fatalf("countMatchingFiles() = %d, want 1", got)
+		if len(got) != 1 {
+			t.Fatalf("collectMatchingFiles() returned %d files, want 1", len(got))
 		}
 	})
 
 	t.Run("recursive counts all", func(t *testing.T) {
 		sc := scanConfig{recursive: true}
-		got, err := countMatchingFiles(dir, sc)
+		got, err := collectMatchingFiles(dir, sc)
 		if err != nil {
-			t.Fatalf("countMatchingFiles() error: %v", err)
+			t.Fatalf("collectMatchingFiles() error: %v", err)
 		}
-		if got != 2 {
-			t.Fatalf("countMatchingFiles() = %d, want 2", got)
+		if len(got) != 2 {
+			t.Fatalf("collectMatchingFiles() returned %d files, want 2", len(got))
 		}
 	})
 }
 
-func TestCountMatchingFilesSkipDirs(t *testing.T) {
+func TestCollectMatchingFilesSkipDirs(t *testing.T) {
 	dir := t.TempDir()
 	gitDir := filepath.Join(dir, ".git")
 	if err := os.MkdirAll(gitDir, 0o755); err != nil {
@@ -934,12 +959,12 @@ func TestCountMatchingFilesSkipDirs(t *testing.T) {
 	}
 
 	sc := scanConfig{recursive: true}
-	got, err := countMatchingFiles(dir, sc)
+	got, err := collectMatchingFiles(dir, sc)
 	if err != nil {
-		t.Fatalf("countMatchingFiles() error: %v", err)
+		t.Fatalf("collectMatchingFiles() error: %v", err)
 	}
-	if got != 1 {
-		t.Fatalf("countMatchingFiles() = %d, want 1 (.git should be skipped)", got)
+	if len(got) != 1 {
+		t.Fatalf("collectMatchingFiles() returned %d files, want 1 (.git should be skipped)", len(got))
 	}
 }
 

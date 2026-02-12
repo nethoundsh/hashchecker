@@ -14,8 +14,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// VirusTotalResult holds the fields we care about from a VirusTotal file report.
-// It's used across the codebase: in cache entries, JSON output, and print functions.
+// VirusTotalResult holds the fields we care about from a VT file report.
 type VirusTotalResult struct {
 	Found       bool   `json:"found"`        // true if VirusTotal has a report for this hash
 	Name        string `json:"name"`         // meaningful_name from the report
@@ -27,12 +26,6 @@ type VirusTotalResult struct {
 	ThreatLabel string `json:"threat_label"` // suggested threat label, if any
 }
 
-// lookupConfig bundles the "environment" needed for a VirusTotal lookup.
-//
-// Go idiom: when a function grows a long parameter list made up mostly of
-// configuration values, group them into a struct. This keeps call sites
-// readable and makes it easy to add new options later without touching
-// every caller.
 type lookupConfig struct {
 	ctx          context.Context
 	client       *http.Client
@@ -46,99 +39,43 @@ type lookupConfig struct {
 	baseURL      string // base URL for VT API; empty defaults to production
 }
 
-// lookupAndPrint is the central "do the thing" function: it checks the
-// cache, calls the VirusTotal API if needed, prints the result in the
-// chosen format, and returns the result to the caller.
-//
-// Combining lookup + print in one function keeps the three call sites
-// (raw hash, single file, directory walk) simple — they each call this
-// one function instead of repeating cache/API/print logic.
-//
-// Go idiom: returning (VirusTotalResult, error) is the standard Go
-// "result, error" pattern. The caller checks err first; if nil, the
-// result is valid.
-//
-// The cfg parameter groups together the "environment" for a lookup
-// (HTTP client, API key, cache, output mode, etc.) so call sites only
-// pass the per-lookup data (path and hash).
-func lookupAndPrint(path, hash string, cfg lookupConfig) (VirusTotalResult, error) {
-	// ── Cache Check ─────────────────────────────────────────────────
-	//
-	// Unless -refresh was passed, try to serve from cache. The cache
-	// key is "algo:hash" (e.g. "sha256:abc123") so results from
-	// different algorithms don't collide. The "comma ok" idiom
-	// (entry, ok := cache[key]) is how you check for map key
-	// existence in Go — ok is true if the key was found.
+// lookup checks the cache and calls the VirusTotal API if needed,
+// returning the result without printing anything.
+func lookup(hash string, cfg lookupConfig) (VirusTotalResult, error) {
+	// Cache key is "algo:hash" so results from different algorithms don't collide.
 	cacheKey := cfg.algo + ":" + hash
 	if !cfg.refresh {
 		if entry, ok := cfg.cache[cacheKey]; ok {
 			age := time.Since(entry.Timestamp)
 			if age < time.Duration(cfg.cacheAgeDays)*24*time.Hour {
-				// Cache hit — result is fresh enough, skip the API call.
-				switch cfg.output {
-				case "json":
-					if err := printJSON(path, hash, cfg.algo, entry.Result); err != nil {
-						return VirusTotalResult{}, fmt.Errorf("formatting output: %w", err)
-					}
-				default:
-					printResult(hash, cfg.algo, entry.Result)
-				}
 				return entry.Result, nil
 			}
-			// Cache entry exists but is too old — fall through to API call.
 		}
 	}
 
-	// ── Rate Limit ──────────────────────────────────────────────────
-	//
-	// Wait for a token from the rate limiter before making an API call.
-	// This is intentionally placed AFTER the cache check — cache hits
-	// don't consume rate limit tokens, which is the key improvement
-	// over the old approach of sleeping before every file regardless.
+	// Rate limit is intentionally placed AFTER the cache check —
+	// cache hits don't consume rate limit tokens.
 	if err := waitForRateLimit(cfg.ctx, cfg.limiter); err != nil {
 		return VirusTotalResult{}, fmt.Errorf("rate limiter: %w", err)
 	}
 
-	// ── API Call ─────────────────────────────────────────────────────
-	//
-	// Cache miss (or -refresh forced): query VirusTotal.
 	result, err := checkVirusTotal(cfg.ctx, cfg.client, cfg.apiKey, hash, cfg.baseURL)
 	if err != nil {
 		return VirusTotalResult{}, err
 	}
 
-	// Store the fresh result in the in-memory cache. The cache is
-	// flushed to disk by the deferred flushCache() in run() on return.
+	// Store fresh result; cache is flushed to disk by deferred flushCache() in run().
 	cfg.cache[cacheKey] = cacheEntry{
 		Result:    result,
 		Timestamp: time.Now(),
 	}
 
-	// ── Output ──────────────────────────────────────────────────────
-	switch cfg.output {
-	case "json":
-		if err := printJSON(path, hash, cfg.algo, result); err != nil {
-			return VirusTotalResult{}, fmt.Errorf("formatting output: %w", err)
-		}
-	default:
-		printResult(hash, cfg.algo, result)
-	}
 	return result, nil
 }
 
-// ── Rate Limiting Helpers ────────────────────────────────────────────
-//
-// waitForRateLimit blocks until the token bucket grants a token, then
-// adds random jitter (0–3 seconds) to prevent exactly periodic requests.
-//
-// If limiter is nil, it returns immediately — this is the "no rate
-// limiting" path for premium users or single-file lookups without -free.
-//
-// Why jitter? Even with a token bucket, perfectly periodic requests
-// (e.g. exactly every 15.000s) can trigger server-side bot detection.
-// Adding 0–3s of randomness makes the traffic pattern look more natural.
-// For free tier (4 req/min = 15s spacing), 0–3s jitter keeps us well
-// within the limit (15–18s between requests).
+// waitForRateLimit blocks until the rate limiter grants a token, then
+// adds random jitter to avoid exactly periodic requests that can trigger
+// server-side bot detection. Returns immediately if limiter is nil.
 func waitForRateLimit(ctx context.Context, limiter *rate.Limiter) error {
 	if limiter == nil {
 		return nil
@@ -146,34 +83,22 @@ func waitForRateLimit(ctx context.Context, limiter *rate.Limiter) error {
 	if err := limiter.Wait(ctx); err != nil {
 		return err
 	}
-	// Add 0–2999ms of random jitter after the token-bucket wait.
-	// Without this, requests fire at exactly the bucket interval
-	// (e.g. every 15.000s for 4 req/min), which looks machine-like
-	// and can trigger server-side bot detection. The jitter makes
-	// inter-request gaps vary (e.g. 15.0–18.0s) while staying
-	// safely under the rate limit.
+	// Jitter prevents exactly periodic requests (e.g. every 15.000s)
+	// which can trigger bot detection on VT's side.
 	jitter := time.Duration(rand.N(3000)) * time.Millisecond
 	time.Sleep(jitter)
 	return nil
 }
 
-// parseRetryAfter parses the HTTP Retry-After header value into a
-// time.Duration. The header can be either:
-//   - An integer number of seconds (e.g. "60")
-//   - An HTTP-date in RFC 1123 format (e.g. "Wed, 21 Oct 2025 07:28:00 GMT")
-//
-// If the header is missing or unparseable, we return a conservative
-// 60-second default — better to wait too long than to hammer the API
-// and risk a ban.
+// parseRetryAfter parses the Retry-After header (integer seconds or
+// RFC 1123 date). Returns 60s default if missing or unparseable.
 func parseRetryAfter(header string) time.Duration {
 	if header == "" {
 		return 60 * time.Second
 	}
-	// Most APIs (including VT) send seconds as a plain integer.
 	if seconds, err := strconv.Atoi(header); err == nil && seconds > 0 {
 		return time.Duration(seconds) * time.Second
 	}
-	// Fall back to RFC 1123 date format (rare, but part of the HTTP spec).
 	if t, err := time.Parse(time.RFC1123, header); err == nil {
 		if d := time.Until(t); d > 0 {
 			return d
@@ -182,22 +107,8 @@ func parseRetryAfter(header string) time.Duration {
 	return 60 * time.Second
 }
 
-// checkVirusTotal queries the VirusTotal v3 API for a file report by
-// hash (SHA-256, SHA-1, or MD5). It retries up to 3 times on HTTP 429
-// (rate limited), using the Retry-After header to determine wait time.
-//
-// Return behavior:
-//   - HTTP 404 → (VirusTotalResult{Found: false}, nil) — hash not in VT
-//   - HTTP 200 → parsed result with Found: true
-//   - HTTP 429 → retry with backoff (up to maxRetries times)
-//   - Any other status → error with truncated response body for debugging
-//
-// The caller passes in a shared *http.Client so that Go's internal
-// connection pool can reuse TCP connections across multiple lookups.
-//
-// Why retry here instead of in the caller? Because 429 handling is an
-// HTTP-level concern — the caller (lookupAndPrint) shouldn't need to
-// know about HTTP status codes or retry semantics.
+// checkVirusTotal queries the VT v3 API for a file report by hash.
+// Retries up to 3 times on HTTP 429 using the Retry-After header.
 func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, baseURL string) (VirusTotalResult, error) {
 	if baseURL == "" {
 		baseURL = "https://www.virustotal.com/api/v3/files/"
@@ -205,46 +116,24 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, bas
 	const maxRetries = 3
 
 	for attempt := range maxRetries {
-		// Build the GET request with context so it can be cancelled
-		// (e.g. on Ctrl+C). http.NewRequestWithContext attaches the
-		// context to the request — if the context is cancelled, the
-		// HTTP client aborts the in-flight request immediately.
 		req, err := http.NewRequestWithContext(ctx, "GET", baseURL+hash, nil)
 		if err != nil {
 			return VirusTotalResult{}, fmt.Errorf("checking virustotal %s: %w", hash, err)
 		}
-		// VirusTotal authenticates via an API key in a custom header.
 		req.Header.Set("x-apikey", apiKey)
 
-		// client.Do sends the request and returns the response.
 		response, err := client.Do(req)
 		if err != nil {
 			return VirusTotalResult{}, fmt.Errorf("checking virustotal %s: %w", hash, err)
 		}
 
-		// Read the entire response body into memory so we can both check
-		// the status code and parse the JSON.
-		//
-		// Note: we use explicit Close() instead of defer because we're
-		// in a loop. defer only runs when the function returns, so
-		// deferring inside a loop would keep all response bodies open
-		// until the function exits — a resource leak.
-		body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20)) // 1 MiB cap
+		// Explicit Close() instead of defer — we're in a loop.
+		body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 		response.Body.Close()
 		if err != nil {
 			return VirusTotalResult{}, fmt.Errorf("reading virustotal response for %s: %w", hash, err)
 		}
 
-		// ── Handle 429 (rate limited) ───────────────────────────────
-		//
-		// VT returns 429 when you've exceeded your API quota. The
-		// Retry-After header tells us how long to wait. We parse it
-		// with parseRetryAfter() (which handles both integer seconds
-		// and RFC 1123 date formats) and sleep before retrying.
-		//
-		// The select statement makes the wait cancellable — if the
-		// user presses Ctrl+C during a retry wait, we bail out
-		// immediately instead of sleeping for the full duration.
 		if response.StatusCode == 429 {
 			if attempt == maxRetries-1 {
 				return VirusTotalResult{}, fmt.Errorf("checking virustotal %s: rate limited after %d retries", hash, maxRetries)
@@ -259,29 +148,14 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, bas
 			continue
 		}
 
-		// 404 = hash not found in VirusTotal's database. This is a normal
-		// condition (not an error) — the file simply hasn't been scanned.
 		if response.StatusCode == 404 {
 			return VirusTotalResult{Found: false}, nil
 		}
 		if response.StatusCode != 200 {
-			// For non-200/404 responses (e.g. 403 bad key),
-			// include a truncated body snippet in the error so the user can
-			// see what VT said.
 			bodyStr := truncateRunes(string(body), 200)
 			return VirusTotalResult{}, fmt.Errorf("checking virustotal %s: unexpected status: %d: %s", hash, response.StatusCode, bodyStr)
 		}
 
-		// ── Parse the VT API v3 response ────────────────────────────
-		//
-		// Go idiom: anonymous struct for one-off JSON parsing. We define
-		// the struct inline because it's only used here. The nested shape
-		// mirrors the VT API response structure:
-		//   { "data": { "attributes": { ... } } }
-		//
-		// We only declare the fields we care about — Go's JSON decoder
-		// silently ignores any extra fields in the response, which makes
-		// our code resilient to API additions.
 		var result struct {
 			Data struct {
 				Attributes struct {
@@ -300,14 +174,10 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, bas
 			} `json:"data"`
 		}
 
-		// json.Unmarshal parses the raw JSON bytes into our struct.
-		// fmt.Errorf with %w wraps the original error so callers can
-		// unwrap it with errors.Is/errors.As if needed.
 		if err := json.Unmarshal(body, &result); err != nil {
 			return VirusTotalResult{}, fmt.Errorf("checking virustotal %s: parsing response: %w", hash, err)
 		}
 
-		// Map the deeply nested API response into our flat result struct.
 		stats := result.Data.Attributes.LastAnalysisStats
 		return VirusTotalResult{
 			Found:       true,
@@ -321,20 +191,11 @@ func checkVirusTotal(ctx context.Context, client *http.Client, apiKey, hash, bas
 		}, nil
 	}
 
-	// This is unreachable in practice — the loop always returns on
-	// success, non-429 error, or final retry. But Go requires all
-	// code paths to have a return statement.
 	return VirusTotalResult{}, fmt.Errorf("exhausted %d retries", maxRetries)
 }
 
-// truncateRunes returns s truncated to at most max runes, with "..."
-// appended if it was truncated.
-//
-// Why runes instead of bytes? In Go, strings are byte sequences, but a
-// single character (like an emoji or accented letter) can be multiple
-// bytes. Converting to []rune gives us actual characters, so we truncate
-// at a clean character boundary instead of potentially splitting a
-// multi-byte character in half and producing garbled output.
+// truncateRunes returns s truncated to at most max runes, appending "..."
+// if truncated. Uses runes to avoid splitting multi-byte characters.
 func truncateRunes(s string, max int) string {
 	if max <= 0 {
 		return ""

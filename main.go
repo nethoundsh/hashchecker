@@ -12,52 +12,43 @@
 package main
 
 import (
-	"context"       // context.Context for cancellation propagation
-	"crypto/md5"    // MD5 hashing (16-byte digest)
-	"crypto/sha1"   // SHA-1 hashing (20-byte digest)
-	"crypto/sha256" // SHA-256 hashing (32-byte digest)
-	"encoding/hex"  // hex encode/decode — used for hash string conversion and validation
-	"flag"          // stdlib CLI flag parsing — simple and idiomatic for Go CLIs
-	"fmt"           // formatted I/O — Printf, Fprintln, etc.
-	"hash"          // hash.Hash interface — common type for all crypto hash functions
-	"io"            // io.Copy for streaming file content into the hasher without loading it all into memory
-	"io/fs"         // filesystem interfaces — fs.SkipDir for WalkDir control, DirEntry for file metadata
-	"net/http"      // HTTP client for VirusTotal API calls
-	"os"            // file operations, environment variables, exit codes
-	"os/signal"     // signal.NotifyContext for graceful Ctrl+C handling
-	"path/filepath" // cross-platform path manipulation and directory walking
-	"strings"       // string utilities — TrimSpace, ToLower
-	"time"          // durations for rate limiting and cache expiry
+	"context"
+	"crypto/md5"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"flag"
+	"fmt"
+	"hash"
+	"io"
+	"io/fs"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"time"
 
-	"github.com/dustin/go-humanize"         // third-party library for parsing human-readable sizes (e.g. "10MB" → bytes)
-	"github.com/fatih/color"                // third-party library for ANSI-colored terminal output
-	"github.com/mattn/go-isatty"            // detect whether a file descriptor is a terminal (TTY)
-	"github.com/schollz/progressbar/v3"     // terminal progress bar with ETA and throughput display
-	"golang.org/x/time/rate"                // token bucket rate limiter for API call pacing
+	"github.com/dustin/go-humanize"
+	"github.com/fatih/color"
+	"github.com/mattn/go-isatty"
+	"github.com/schollz/progressbar/v3"
+	"golang.org/x/time/rate"
 )
 
-// version identifies the build of hashchecker. This is printed via the
-// -version flag and can be overridden at build time with:
+// version can be overridden at build time with:
 //
 //	go build -ldflags "-X main.version=v1.2.3"
 var version = "dev"
 
-// skipDirs lists directory names that should always be skipped during
-// directory scanning. These are typically version-control metadata,
-// dependency caches, or IDE config folders — large trees of files that
-// are irrelevant for malware scanning and would waste API quota.
-//
-// Go idiom: using a map[string]bool as a set. Lookups like
-// skipDirs["node_modules"] return true if present, false (the zero
-// value for bool) if absent — so it works as a clean membership test.
+// skipDirs lists directory names that are irrelevant for malware
+// scanning (VCS metadata, dependency caches, IDE config).
 var skipDirs = map[string]bool{
 	".git": true, "node_modules": true, "__pycache__": true,
 	"vendor": true, ".venv": true, ".idea": true, ".vscode": true,
 }
 
-// scanConfig bundles the file-filter and scan flags that runFile and runDir
-// both need. Extracting these into a struct keeps parameter lists short when
-// passing filter state from run() to the helper functions.
 type scanConfig struct {
 	recursive  bool
 	includes   []string
@@ -68,17 +59,59 @@ type scanConfig struct {
 	maxSizeStr string
 }
 
+type appConfig struct {
+	lookupCfg    lookupConfig
+	scanCfg      scanConfig
+	arg          string
+	showProgress bool
+	flushCache   func()
+	stop         func()
+}
+
+var (
+	errVersion = errors.New("version requested")
+	errUsage   = errors.New("no arguments provided")
+)
+
 func main() {
 	os.Exit(run())
 }
 
 func run() int {
-	// ── CLI Flag Definitions ────────────────────────────────────────────
-	//
-	// Go idiom: flag.Bool / flag.String / flag.Int return *pointers*.
-	// You dereference them later with *freeMode, *output, etc.
-	// This is because the flag package needs to write to these variables
-	// when it parses the command-line arguments during flag.Parse().
+	cfg, err := parseConfig()
+	if err != nil {
+		switch {
+		case errors.Is(err, errVersion):
+			fmt.Println("hashchecker", version)
+			return 0
+		case errors.Is(err, errUsage):
+			flag.Usage()
+			return 1
+		default:
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	defer cfg.stop()
+	defer cfg.flushCache()
+
+	if isHexHash(cfg.arg, cfg.lookupCfg.algo) {
+		return runHash(cfg.arg, cfg.lookupCfg)
+	}
+	fi, err := os.Stat(cfg.arg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		return 1
+	}
+	if fi.IsDir() {
+		return runDir(cfg.arg, cfg.lookupCfg, cfg.scanCfg, cfg.showProgress)
+	}
+	return runFile(cfg.arg, fi, cfg.lookupCfg, cfg.scanCfg)
+}
+
+// parseConfig parses CLI flags, validates inputs, and initializes all
+// resources (cache, HTTP client, rate limiter, signal handler).
+func parseConfig() (appConfig, error) {
 	freeMode := flag.Bool("free", false, "use free-tier rate limiting (4 requests/min)")
 	rateLimit := flag.Int("rate", 0, "max API requests per minute (0 = no limit; overrides -free)")
 	output := flag.String("o", "text", "output format: text or json")
@@ -91,62 +124,25 @@ func run() int {
 	algo := flag.String("algo", "sha256", "hash algorithm: sha256, sha1, or md5")
 	showVersion := flag.Bool("version", false, "print version and exit")
 
-	// ── File Filter Flags ───────────────────────────────────────────
-	//
-	// These flags let you narrow which files get hashed and looked up.
-	// Filtering happens BEFORE hashing, so excluded files don't waste
-	// CPU on hash computation or API quota on VirusTotal lookups.
-	//
-	// We use flag.String (not a custom flag.Value) for simplicity.
-	// Comma-separated values are split after parsing — this avoids
-	// the complexity of a custom flag type for a single-file project.
 	include := flag.String("include", "", "comma-separated glob patterns — only process matching files (e.g. \"*.exe,*.dll\")")
 	exclude := flag.String("exclude", "", "comma-separated glob patterns — skip matching files (e.g. \"*.tmp,*.log\")")
 	minSizeStr := flag.String("min-size", "", "minimum file size with units (e.g. \"1KB\", \"10MB\")")
 	maxSizeStr := flag.String("max-size", "", "maximum file size with units (e.g. \"100MB\", \"1GB\")")
 
-	// Customize the usage message printed by -h or when no arguments
-	// are provided. flag.PrintDefaults() formats all registered flags
-	// with their types and default values.
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: hashchecker [flags] <file | hash | directory>\n\nFlags:\n")
 		flag.PrintDefaults()
 	}
 
-	// flag.Parse() processes os.Args[1:] and populates all the flag
-	// pointers above. Any remaining non-flag arguments (the file path
-	// or hash) are available via flag.Arg(n) / flag.NArg().
 	flag.Parse()
 
-	// -version is a common convention for CLIs — print version and exit
-	// without requiring any positional arguments.
 	if *showVersion {
-		fmt.Println("hashchecker", version)
-		return 0
+		return appConfig{}, errVersion
 	}
 
-	// ── Signal Handling ─────────────────────────────────────────────
-	//
-	// Create a context that is cancelled when the user presses Ctrl+C.
-	// This lets long-running operations (rate-limit waits, HTTP requests)
-	// exit cleanly instead of hanging. The deferred stop() restores
-	// default signal behavior when run() returns.
+	// Cancelled on Ctrl+C so long-running operations exit cleanly.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
 
-	// ── Parse Filter Flags ──────────────────────────────────────────
-	//
-	// Convert the raw string flag values into typed Go values that
-	// the shouldProcess() function can use efficiently.
-
-	// parsePatterns splits a comma-separated string into a slice of
-	// trimmed, non-empty patterns. Returns nil for an empty input.
-	//
-	// Go idiom: a nil slice and an empty slice ([]string{}) behave
-	// identically with len() and range, so nil is the idiomatic way
-	// to represent "nothing" for slices. This matters because we
-	// check len(includes) > 0 in shouldProcess to decide whether
-	// the include filter is active.
 	parsePatterns := func(s string) []string {
 		if s == "" {
 			return nil
@@ -165,10 +161,6 @@ func run() int {
 	includes := parsePatterns(*include)
 	excludes := parsePatterns(*exclude)
 
-	// Validate all glob patterns up front so we fail fast with a
-	// clear error message rather than failing mid-scan on the first
-	// matching file. filepath.Match returns filepath.ErrBadPattern
-	// for malformed patterns like "[unclosed-bracket".
 	validatePatterns := func(flagName string, patterns []string) error {
 		for _, p := range patterns {
 			if _, err := filepath.Match(p, "test"); err != nil {
@@ -178,31 +170,21 @@ func run() int {
 		return nil
 	}
 	if err := validatePatterns("-include", includes); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+		stop()
+		return appConfig{}, err
 	}
 	if err := validatePatterns("-exclude", excludes); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+		stop()
+		return appConfig{}, err
 	}
 
-	// Parse human-readable size strings into byte counts.
-	//
-	// humanize.ParseBytes understands units like B, KB, MB, GB, TB.
-	// It returns uint64 because file sizes are never negative. We
-	// convert to int64 because os.FileInfo.Size() returns int64 —
-	// keeping the same type avoids mixed-type comparisons.
-	//
-	// A value of 0 means "no limit" — this is our sentinel. Zero
-	// works because a 0-byte minimum is effectively "no minimum" and
-	// a 0-byte maximum would make no practical sense.
-	var minSize, maxSize int64
+	var minSize, maxSize int64 // 0 means "no limit"
 
 	if *minSizeStr != "" {
 		bytes, err := humanize.ParseBytes(*minSizeStr)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid -min-size value %q: %v\n", *minSizeStr, err)
-			return 1
+			stop()
+			return appConfig{}, fmt.Errorf("invalid -min-size value %q: %v", *minSizeStr, err)
 		}
 		minSize = int64(bytes)
 	}
@@ -210,108 +192,64 @@ func run() int {
 	if *maxSizeStr != "" {
 		bytes, err := humanize.ParseBytes(*maxSizeStr)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid -max-size value %q: %v\n", *maxSizeStr, err)
-			return 1
+			stop()
+			return appConfig{}, fmt.Errorf("invalid -max-size value %q: %v", *maxSizeStr, err)
 		}
 		maxSize = int64(bytes)
 	}
 
-	// Sanity check: if both are set, min must not exceed max.
 	if minSize > 0 && maxSize > 0 && minSize > maxSize {
-		fmt.Fprintf(os.Stderr, "-min-size (%s) cannot be greater than -max-size (%s)\n",
+		stop()
+		return appConfig{}, fmt.Errorf("-min-size (%s) cannot be greater than -max-size (%s)",
 			*minSizeStr, *maxSizeStr)
-		return 1
 	}
 
-	// Validate the output format immediately. A switch with empty "ok"
-	// cases is a common Go pattern for whitelisting allowed values.
 	switch *output {
 	case "text", "json":
-		// ok — valid output format
 	default:
-		fmt.Fprintln(os.Stderr, "invalid -o value; must be 'text' or 'json'")
-		return 1
+		stop()
+		return appConfig{}, fmt.Errorf("invalid -o value; must be 'text' or 'json'")
 	}
 
-	// Validate the hash algorithm. Same whitelisting pattern.
 	switch *algo {
 	case "sha256", "sha1", "md5":
-		// ok — valid algorithm
 	default:
-		fmt.Fprintln(os.Stderr, "invalid -algo value; must be 'sha256', 'sha1', or 'md5'")
-		return 1
+		stop()
+		return appConfig{}, fmt.Errorf("invalid -algo value; must be 'sha256', 'sha1', or 'md5'")
 	}
 
-	// Disable color when outputting JSON (so it can be parsed by other
-	// tools) or when the user explicitly requests no color.
-	// color.NoColor is a package-level variable from fatih/color that
-	// globally disables ANSI escape codes when set to true.
 	if *output == "json" || *noColor {
 		color.NoColor = true
 	}
 
-	// ── Progress Bar Decision ───────────────────────────────────────
-	//
-	// Show a progress bar for directory scans when:
-	//   1. Output is text (not JSON — JSON consumers parse stdout)
-	//   2. User hasn't explicitly disabled it with -no-progress
-	//   3. Stderr is a real terminal (not piped or redirected)
-	//
-	// Why stderr? The bar writes to stderr so that piping stdout
-	// (e.g. hashchecker -r dir > results.txt) still shows progress
-	// on the terminal. isatty checks whether stderr is a TTY.
+	// Progress bar: text output only, on a real terminal (not piped).
 	showProgress := *output == "text" && !*noProgress &&
 		isatty.IsTerminal(os.Stderr.Fd())
 
-	// ── Rate Limiter Setup ──────────────────────────────────────────
-	//
-	// Resolve the effective rate from -free and --rate flags.
-	// --rate takes precedence: if set to a non-zero value, it overrides
-	// -free. If neither is set, effectiveRate stays 0 (no limiting).
-	//
-	// Go idiom: using a nil pointer to represent "feature disabled."
-	// We check limiter != nil before calling Wait(), so callers don't
-	// need separate "is rate limiting enabled?" booleans.
+	// --rate overrides -free. Burst of 1 matches VT's sliding window.
 	effectiveRate := *rateLimit
 	if effectiveRate == 0 && *freeMode {
-		effectiveRate = 4 // VT free tier: 4 requests per minute
+		effectiveRate = 4
 	}
 
 	var limiter *rate.Limiter
 	if effectiveRate > 0 {
-		// rate.Every converts "one event per duration" into a rate.Limit.
-		// For 4 req/min: time.Minute / 4 = 15s → one token every 15 seconds.
-		// Burst of 1 means we never "bank" unused tokens — each request
-		// must wait for its own token. This matches VT's sliding window.
 		limiter = rate.NewLimiter(rate.Every(time.Minute/time.Duration(effectiveRate)), 1)
 		fmt.Fprintf(os.Stderr, "Rate limiting: %d requests/min\n", effectiveRate)
 	}
 
-	// Require at least one positional argument (the target to scan).
-	// flag.NArg() returns the count of non-flag arguments remaining
-	// after flag.Parse().
 	if flag.NArg() < 1 {
-		flag.Usage()
-		return 1
+		stop()
+		return appConfig{}, errUsage
 	}
 
-	// ── Cache Initialization ────────────────────────────────────────────
-	//
-	// The cache maps "algo:hash" keys to their VirusTotal results and
-	// a timestamp. This avoids redundant API calls for files that have
-	// already been checked recently.
-	//
-	// We declare the cache and its path here so they're available to
-	// all code paths (hash lookup, single file, directory scan).
+	// Graceful degradation: warn and continue without caching on errors.
 	var cache map[string]cacheEntry
 	var cachePath string
 	if !*noCache {
 		var err error
 		cachePath, err = getCacheFilePath()
 		if err != nil {
-			// Graceful degradation: if we can't determine the cache path
-			// (e.g. HOME isn't set), we warn and continue without caching
-			// rather than failing the entire run.
 			fmt.Fprintln(os.Stderr, "Warning: cache disabled:", err)
 			cache = make(map[string]cacheEntry)
 		} else {
@@ -321,17 +259,10 @@ func run() int {
 			}
 		}
 	}
-	// Ensure cache is never nil so we can always read/write it without
-	// nil-pointer checks throughout the code. This is a common Go
-	// defensive pattern: initialize maps before use.
 	if cache == nil {
 		cache = make(map[string]cacheEntry)
 	}
 
-	// flushCache is a closure that persists the in-memory cache to disk.
-	// We define it as a closure (anonymous function assigned to a variable)
-	// so it captures the cachePath and cache variables from the enclosing
-	// scope. This avoids passing them as parameters at every exit point.
 	flushCache := func() {
 		if !*noCache && cachePath != "" {
 			if err := saveCache(cachePath, cache); err != nil {
@@ -339,88 +270,56 @@ func run() int {
 			}
 		}
 	}
-	defer flushCache()
 
-	// ── HTTP Client & API Key ───────────────────────────────────────────
-	//
-	// Create a single shared HTTP client. Go's http.Client reuses TCP
-	// connections internally (via its Transport), so creating one client
-	// and passing it around is more efficient than creating a new one per
-	// request. The 15-second timeout covers the full request lifecycle
-	// (DNS, connect, TLS handshake, response headers, body read).
 	client := &http.Client{Timeout: 15 * time.Second}
 
-	// Read and validate the API key up front so we fail fast before
-	// doing any expensive work (hashing files, etc.).
-	// strings.TrimSpace removes any trailing newline that might sneak
-	// in from a shell export or .env file.
 	apiKey := strings.TrimSpace(os.Getenv("VIRUSTOTAL_API_KEY"))
 	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "VIRUSTOTAL_API_KEY is not set")
-		return 1
+		stop()
+		return appConfig{}, fmt.Errorf("VIRUSTOTAL_API_KEY is not set")
 	}
 
-	// The first positional argument — either a hex hash string, a file
-	// path, or a directory path.
 	arg := flag.Arg(0)
 
-	// Bundle the lookup configuration into a struct so we don't have to
-	// thread a long parameter list through every call site.
-	cfg := lookupConfig{
-		ctx:          ctx,
-		client:       client,
-		apiKey:       apiKey,
-		output:       *output,
-		algo:         *algo,
-		cache:        cache,
-		refresh:      *refresh,
-		cacheAgeDays: *cacheAge,
-		limiter:      limiter,
-		baseURL:      os.Getenv("VIRUSTOTAL_BASE_URL"),
-	}
+	return appConfig{
+		lookupCfg: lookupConfig{
+			ctx:          ctx,
+			client:       client,
+			apiKey:       apiKey,
+			output:       *output,
+			algo:         *algo,
+			cache:        cache,
+			refresh:      *refresh,
+			cacheAgeDays: *cacheAge,
+			limiter:      limiter,
+			baseURL:      os.Getenv("VIRUSTOTAL_BASE_URL"),
+		},
+		scanCfg: scanConfig{
+			recursive:  *recursive,
+			includes:   includes,
+			excludes:   excludes,
+			minSize:    minSize,
+			maxSize:    maxSize,
+			minSizeStr: *minSizeStr,
+			maxSizeStr: *maxSizeStr,
+		},
+		arg:          arg,
+		showProgress: showProgress,
+		flushCache:   flushCache,
+		stop:         stop,
+	}, nil
+}
 
-	// ── Dispatch ────────────────────────────────────────────────────────
-	//
-	// Bundle filter flags into a scanConfig for the helper functions,
-	// then dispatch to the appropriate handler based on the argument type.
-	sc := scanConfig{
-		recursive:  *recursive,
-		includes:   includes,
-		excludes:   excludes,
-		minSize:    minSize,
-		maxSize:    maxSize,
-		minSizeStr: *minSizeStr,
-		maxSizeStr: *maxSizeStr,
-	}
+// Exit codes: 0 = clean, 1 = error, 2 = malicious file(s) found.
 
-	if isHexHash(arg, *algo) {
-		return runHash(arg, cfg)
-	}
-
-	fi, err := os.Stat(arg)
+func runHash(arg string, cfg lookupConfig) int {
+	hash := strings.ToLower(arg)
+	result, err := lookup(hash, cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
-	if fi.IsDir() {
-		return runDir(arg, cfg, sc, showProgress)
-	}
-	return runFile(arg, fi, cfg, sc)
-}
-
-// ── Extracted Helpers ───────────────────────────────────────────────
-//
-// runHash, runDir, and runFile each handle one of the three dispatch
-// branches in run(). They return an exit code: 0 = clean, 1 = error,
-// 2 = malicious file(s) found.
-
-// runHash handles the case where the user passes a raw hex hash
-// string. It normalizes the hash to lowercase, looks it up on
-// VirusTotal, and returns the appropriate exit code.
-func runHash(arg string, cfg lookupConfig) int {
-	hash := strings.ToLower(arg)
-	result, err := lookupAndPrint("", hash, cfg)
-	if err != nil {
+	if err := printLookupResult("", hash, cfg, result); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
@@ -430,26 +329,56 @@ func runHash(arg string, cfg lookupConfig) int {
 	return 0
 }
 
-// runDir handles the case where the user passes a directory path.
-// It walks the directory tree (optionally recursive), hashes each
-// matching file, looks it up on VirusTotal, and prints a summary.
-//
-// When showProgress is true, a pre-walk counts matching files so
-// we can display a determinate progress bar with percentage and ETA.
+// runDir walks a directory, hashes each matching file, and looks it up.
+// With showProgress, files are collected first to get a total for the bar.
 func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int {
 	var looked, found, malicious int
-
-	// ── Progress Bar Setup ──────────────────────────────────────────
-	//
-	// Pre-walk the directory to count matching files. This is fast
-	// (no hashing or API calls) and gives us a total for the bar.
 	var bar *progressbar.ProgressBar
-	if showProgress {
-		total, err := countMatchingFiles(arg, sc)
+
+	processFile := func(path string) {
+		hash, err := hashFile(path, cfg.algo)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "Warning: could not count files:", err)
-		} else if total > 0 {
-			bar = progressbar.NewOptions(total,
+			fmt.Fprintln(os.Stderr, "Error:", path, err)
+			return
+		}
+
+		if cfg.output == "text" {
+			fmt.Println(color.HiBlueString("--- %s ---", path))
+		}
+
+		result, err := lookup(hash, cfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			return
+		}
+		if err := printLookupResult(path, hash, cfg, result); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			return
+		}
+
+		looked++
+		if result.Found {
+			found++
+			if result.Malicious > 0 {
+				malicious++
+			}
+		}
+
+		if bar != nil {
+			_ = bar.Add(1)
+		}
+	}
+
+	var err error
+
+	if showProgress {
+		files, collectErr := collectMatchingFiles(arg, sc)
+		if collectErr != nil {
+			fmt.Fprintln(os.Stderr, "Warning: could not collect files:", collectErr)
+		}
+
+		if len(files) > 0 {
+			bar = progressbar.NewOptions(len(files),
 				progressbar.OptionSetWriter(os.Stderr),
 				progressbar.OptionSetDescription("Scanning"),
 				progressbar.OptionShowCount(),
@@ -466,72 +395,50 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 				}),
 			)
 		}
+
+		for _, path := range files {
+			if cfg.ctx.Err() != nil {
+				err = cfg.ctx.Err()
+				break
+			}
+			processFile(path)
+		}
+	} else {
+		err = filepath.WalkDir(arg, func(path string, d fs.DirEntry, walkErr error) error {
+			if cfg.ctx.Err() != nil {
+				return cfg.ctx.Err()
+			}
+			if walkErr != nil {
+				fmt.Fprintln(os.Stderr, "Error:", path, walkErr)
+				return nil
+			}
+			if d.IsDir() {
+				if path != arg {
+					if skipDirs[d.Name()] {
+						return fs.SkipDir
+					}
+					if !sc.recursive {
+						return fs.SkipDir
+					}
+				}
+				return nil
+			}
+			if !d.Type().IsRegular() {
+				return nil
+			}
+			ok, filterErr := shouldProcess(d, sc.includes, sc.excludes, sc.minSize, sc.maxSize)
+			if filterErr != nil {
+				fmt.Fprintln(os.Stderr, "Warning:", path, filterErr)
+				return nil
+			}
+			if !ok {
+				return nil
+			}
+			processFile(path)
+			return nil
+		})
 	}
 
-	err := filepath.WalkDir(arg, func(path string, d fs.DirEntry, err error) error {
-		if cfg.ctx.Err() != nil {
-			return cfg.ctx.Err()
-		}
-
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", path, err)
-			return nil
-		}
-
-		if d.IsDir() {
-			if path != arg {
-				if skipDirs[d.Name()] {
-					return fs.SkipDir
-				}
-				if !sc.recursive {
-					return fs.SkipDir
-				}
-			}
-			return nil
-		}
-
-		if !d.Type().IsRegular() {
-			return nil
-		}
-
-		ok, filterErr := shouldProcess(d, sc.includes, sc.excludes, sc.minSize, sc.maxSize)
-		if filterErr != nil {
-			fmt.Fprintln(os.Stderr, "Warning:", path, filterErr)
-			return nil
-		}
-		if !ok {
-			return nil
-		}
-
-		hash, err := hashFile(path, cfg.algo)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", path, err)
-			return nil
-		}
-
-		if cfg.output == "text" {
-			fmt.Println(color.HiBlueString("--- %s ---", path))
-		}
-
-		result, err := lookupAndPrint(path, hash, cfg)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			return nil
-		}
-
-		looked++
-		if result.Found {
-			found++
-			if result.Malicious > 0 {
-				malicious++
-			}
-		}
-
-		if bar != nil {
-			_ = bar.Add(1)
-		}
-		return nil
-	})
 	if bar != nil {
 		_ = bar.Finish()
 	}
@@ -564,16 +471,10 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 	return 0
 }
 
-// countMatchingFiles does a fast pre-walk of the directory tree using
-// the same dir-skip and shouldProcess() filter logic as runDir, but
-// only counts files — no hashing or API calls. This gives us a total
-// for the progress bar so it can show percentage and ETA.
-//
-// Even for thousands of files, this completes in milliseconds because
-// it only reads directory entries and (when size filters are active)
-// file metadata — no file contents are read.
-func countMatchingFiles(root string, sc scanConfig) (int, error) {
-	count := 0
+// collectMatchingFiles walks the directory tree once and returns paths
+// of all files that pass the dir-skip and shouldProcess() filters.
+func collectMatchingFiles(root string, sc scanConfig) ([]string, error) {
+	var files []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // skip inaccessible entries
@@ -596,16 +497,14 @@ func countMatchingFiles(root string, sc scanConfig) (int, error) {
 		if filterErr != nil || !ok {
 			return nil
 		}
-		count++
+		files = append(files, path)
 		return nil
 	})
-	return count, err
+	return files, err
 }
 
-// runFile handles the case where the user passes a path to a single file.
-// Glob filters (-include/-exclude) are not applied — the user explicitly
-// named this file. Size filters still apply because a pipeline may
-// enforce size constraints.
+// runFile handles a single file. Glob filters are not applied (user
+// explicitly named this file), but size filters still apply.
 func runFile(arg string, fi os.FileInfo, cfg lookupConfig, sc scanConfig) int {
 	if sc.minSize > 0 || sc.maxSize > 0 {
 		fileSize := fi.Size()
@@ -626,8 +525,12 @@ func runFile(arg string, fi os.FileInfo, cfg lookupConfig, sc scanConfig) int {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
-	result, err := lookupAndPrint(arg, hash, cfg)
+	result, err := lookup(hash, cfg)
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		return 1
+	}
+	if err := printLookupResult(arg, hash, cfg, result); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
@@ -637,21 +540,7 @@ func runFile(arg string, fi os.FileInfo, cfg lookupConfig, sc scanConfig) int {
 	return 0
 }
 
-// ── Utility Functions ───────────────────────────────────────────────
-
-// isHexHash reports whether s looks like a valid hex-encoded hash for
-// the given algorithm. Each algorithm has a fixed digest size:
-//   - SHA-256 = 32 bytes (64 hex chars)
-//   - SHA-1   = 20 bytes (40 hex chars)
-//   - MD5     = 16 bytes (32 hex chars)
-//
-// Rather than checking length and character set separately, we use
-// hex.DecodeString which validates both in one call — if the string
-// has an odd length or non-hex characters, it returns an error.
-// We then confirm the decoded length matches the expected digest size.
-//
-// Go naming convention: functions that return bool are often named
-// "isSomething" or "hasSomething" for readability at the call site.
+// isHexHash reports whether s is a valid hex hash for the given algorithm.
 func isHexHash(s, algo string) bool {
 	b, err := hex.DecodeString(s)
 	if err != nil {
@@ -669,22 +558,8 @@ func isHexHash(s, algo string) bool {
 	}
 }
 
-// hashFile computes the hash of the file at filePath using the specified
-// algorithm and returns it as a lowercase hex string.
-//
-// Go idiom: hash.Hash is the standard interface that all crypto hash
-// functions (sha256, sha1, md5) implement. It also satisfies io.Writer,
-// so the same io.Copy streaming pattern works for any algorithm —
-// polymorphism through interfaces.
-//
-// Go idiom: defer file.Close() guarantees the file handle is released
-// when the function returns, regardless of whether we return normally
-// or via an error. This prevents file descriptor leaks.
-//
-// Go idiom: io.Copy streams data from the file (an io.Reader) into the
-// hash (an io.Writer) in chunks. This means we never load the entire
-// file into memory — critical for hashing large files without running
-// out of RAM.
+// hashFile computes the hash of filePath and returns it as a lowercase hex string.
+// It streams the file through io.Copy to avoid loading it entirely into memory.
 func hashFile(filePath, algo string) (_ string, err error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -696,10 +571,6 @@ func hashFile(filePath, algo string) (_ string, err error) {
 		}
 	}()
 
-	// Select the hash function based on the algorithm flag. Each
-	// New() returns a hash.Hash, which implements io.Writer. Each
-	// Write call updates the running hash. Sum(nil) finalizes it
-	// and returns the digest bytes.
 	var h hash.Hash
 	switch algo {
 	case "sha256":
