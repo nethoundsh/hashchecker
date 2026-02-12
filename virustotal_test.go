@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -258,6 +259,7 @@ func TestLookup(t *testing.T) {
 				output:       "text",
 				algo:         "sha256",
 				cache:        tt.cache,
+				cacheMu:      &sync.Mutex{},
 				refresh:      tt.refresh,
 				cacheAgeDays: 7,
 				limiter:      nil,

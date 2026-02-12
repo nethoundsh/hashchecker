@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -33,6 +34,7 @@ type lookupConfig struct {
 	output       string
 	algo         string // hash algorithm: "sha256", "sha1", or "md5"
 	cache        map[string]cacheEntry
+	cacheMu      *sync.Mutex // protects cache; pointer so lookupConfig stays copyable
 	refresh      bool
 	cacheAgeDays int
 	limiter      *rate.Limiter
@@ -45,7 +47,10 @@ func lookup(hash string, cfg lookupConfig) (VirusTotalResult, error) {
 	// Cache key is "algo:hash" so results from different algorithms don't collide.
 	cacheKey := cfg.algo + ":" + hash
 	if !cfg.refresh {
-		if entry, ok := cfg.cache[cacheKey]; ok {
+		cfg.cacheMu.Lock()
+		entry, ok := cfg.cache[cacheKey]
+		cfg.cacheMu.Unlock()
+		if ok {
 			age := time.Since(entry.Timestamp)
 			if age < time.Duration(cfg.cacheAgeDays)*24*time.Hour {
 				return entry.Result, nil
@@ -65,10 +70,12 @@ func lookup(hash string, cfg lookupConfig) (VirusTotalResult, error) {
 	}
 
 	// Store fresh result; cache is flushed to disk by deferred flushCache() in run().
+	cfg.cacheMu.Lock()
 	cfg.cache[cacheKey] = cacheEntry{
 		Result:    result,
 		Timestamp: time.Now(),
 	}
+	cfg.cacheMu.Unlock()
 
 	return result, nil
 }
@@ -86,8 +93,12 @@ func waitForRateLimit(ctx context.Context, limiter *rate.Limiter) error {
 	// Jitter prevents exactly periodic requests (e.g. every 15.000s)
 	// which can trigger bot detection on VT's side.
 	jitter := time.Duration(rand.N(3000)) * time.Millisecond
-	time.Sleep(jitter)
-	return nil
+	select {
+	case <-time.After(jitter):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // parseRetryAfter parses the Retry-After header (integer seconds or

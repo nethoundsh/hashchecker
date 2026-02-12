@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"io"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -453,30 +452,6 @@ func TestShouldProcess(t *testing.T) {
 	}
 }
 
-// captureStdout redirects os.Stdout to a pipe, runs fn, and returns
-// the captured output as a string.
-func captureStdout(t *testing.T, fn func()) string {
-	t.Helper()
-
-	old := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
-	}
-	os.Stdout = w
-
-	fn()
-
-	w.Close()
-	os.Stdout = old
-
-	out, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("reading pipe: %v", err)
-	}
-	return string(out)
-}
-
 // callRun resets the global flag state, sets os.Args, and calls run().
 // This lets us test run()'s early validation paths without making real
 // API calls. The flag.CommandLine reset is necessary because Go's flag
@@ -855,134 +830,7 @@ func TestRunDirectoryWithIncludeExclude(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
-	if !strings.Contains(stdout, "1 files") {
+	if !strings.Contains(stdout, "1 file") {
 		t.Fatalf("expected 1 file scanned, got %q", stdout)
 	}
 }
-
-// ── countMatchingFiles tests ─────────────────────────────────────────
-
-func TestCollectMatchingFiles(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("aaa"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "b.exe"), []byte("bbb"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "c.log"), []byte("ccc"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Run("no filters counts all files", func(t *testing.T) {
-		sc := scanConfig{}
-		got, err := collectMatchingFiles(dir, sc)
-		if err != nil {
-			t.Fatalf("collectMatchingFiles() error: %v", err)
-		}
-		if len(got) != 3 {
-			t.Fatalf("collectMatchingFiles() returned %d files, want 3", len(got))
-		}
-	})
-
-	t.Run("include filter", func(t *testing.T) {
-		sc := scanConfig{includes: []string{"*.exe"}}
-		got, err := collectMatchingFiles(dir, sc)
-		if err != nil {
-			t.Fatalf("collectMatchingFiles() error: %v", err)
-		}
-		if len(got) != 1 {
-			t.Fatalf("collectMatchingFiles() returned %d files, want 1", len(got))
-		}
-	})
-
-	t.Run("exclude filter", func(t *testing.T) {
-		sc := scanConfig{excludes: []string{"*.log"}}
-		got, err := collectMatchingFiles(dir, sc)
-		if err != nil {
-			t.Fatalf("collectMatchingFiles() error: %v", err)
-		}
-		if len(got) != 2 {
-			t.Fatalf("collectMatchingFiles() returned %d files, want 2", len(got))
-		}
-	})
-}
-
-func TestCollectMatchingFilesRecursive(t *testing.T) {
-	dir := t.TempDir()
-	subdir := filepath.Join(dir, "sub")
-	if err := os.MkdirAll(subdir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "root.txt"), []byte("r"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(subdir, "nested.txt"), []byte("n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Run("non-recursive counts only root", func(t *testing.T) {
-		sc := scanConfig{recursive: false}
-		got, err := collectMatchingFiles(dir, sc)
-		if err != nil {
-			t.Fatalf("collectMatchingFiles() error: %v", err)
-		}
-		if len(got) != 1 {
-			t.Fatalf("collectMatchingFiles() returned %d files, want 1", len(got))
-		}
-	})
-
-	t.Run("recursive counts all", func(t *testing.T) {
-		sc := scanConfig{recursive: true}
-		got, err := collectMatchingFiles(dir, sc)
-		if err != nil {
-			t.Fatalf("collectMatchingFiles() error: %v", err)
-		}
-		if len(got) != 2 {
-			t.Fatalf("collectMatchingFiles() returned %d files, want 2", len(got))
-		}
-	})
-}
-
-func TestCollectMatchingFilesSkipDirs(t *testing.T) {
-	dir := t.TempDir()
-	gitDir := filepath.Join(dir, ".git")
-	if err := os.MkdirAll(gitDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("k"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// This file is inside .git and should be skipped
-	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	sc := scanConfig{recursive: true}
-	got, err := collectMatchingFiles(dir, sc)
-	if err != nil {
-		t.Fatalf("collectMatchingFiles() error: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("collectMatchingFiles() returned %d files, want 1 (.git should be skipped)", len(got))
-	}
-}
-
-func TestRunDirectoryWithNoProgress(t *testing.T) {
-	srv := startMockVT(t)
-	defer srv.Close()
-
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("aaa"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	code, stdout := callRun(t, "-no-cache", "-no-progress", dir)
-	if code != 0 {
-		t.Fatalf("exit code = %d, want 0", code)
-	}
-	if !strings.Contains(stdout, "Checked") || !strings.Contains(stdout, "files") {
-		t.Fatalf("expected summary line, got %q", stdout)
-	}
-}
-

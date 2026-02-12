@@ -300,7 +300,7 @@ All errors are wrapped with contextual information using Go's `fmt.Errorf("conte
 
 2. **The error chain is preserved.** The `%w` verb (not `%v`) ensures that `errors.Is(err, os.ErrPermission)` still works on wrapped errors, so programmatic error handling remains reliable.
 
-3. **No double-wrapping.** Each function adds only the context it owns. For example, `checkVirusTotal` adds the hash (`"checking virustotal abc123: ..."`), so its caller `lookupAndPrint` does not re-wrap with the same hash.
+3. **No double-wrapping.** Each function adds only the context it owns. For example, `checkVirusTotal` adds the hash (`"checking virustotal abc123: ..."`), so its caller `lookup` does not re-wrap with the same hash.
 
 Example error messages:
 
@@ -316,9 +316,9 @@ Error: writing cache: write /tmp/results.json.tmp: no space left on device
 
 ```
 hashchecker/
-  main.go                        Entry point, CLI flags, run() setup, dispatch helpers (runHash, runDir, runFile), hashing
-  virustotal.go                  VirusTotal API client, result types, rate limiting, retry logic
-  output.go                      Text and JSON output formatting, color helpers
+  main.go                        Entry point, parseConfig(), run() dispatch, helpers (runHash, runDir, runFile), hashing
+  virustotal.go                  VirusTotal API client, lookup(), result types, rate limiting, retry logic
+  output.go                      Text and JSON output formatting, printLookupResult(), color helpers
   cache.go                       Disk cache: load, save (atomic), expiry
   filter.go                      File filtering by glob pattern and size
   main_test.go                   Tests for run(), hashing, filters, retry parsing
@@ -363,7 +363,7 @@ The test suite has **123 tests** (including subtests) across 4 test files with *
 **`virustotal_test.go`** — httptest-based integration tests:
 - **`TestCheckVirusTotal`** — HTTP client against a mock server (200 success, clean file, 404 not found, 429 retry, 429 exhausted, 403 bad key, bad JSON, context cancellation)
 - **`TestCheckVirusTotalSendsAPIKey`** — verifies API key header is sent
-- **`TestLookupAndPrint`** — cache + API + output integration (cache miss, cache hit, expired cache, refresh bypass, JSON output)
+- **`TestLookup`** — cache + API integration (cache miss, cache hit, expired cache, refresh bypass)
 - **`TestWaitForRateLimit`** — rate limiter (nil limiter, fast limiter, cancelled context)
 
 **`output_test.go`** — Output formatting:

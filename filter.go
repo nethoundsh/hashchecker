@@ -15,6 +15,7 @@ func shouldProcess(d fs.DirEntry, includes, excludes []string, minSize, maxSize 
 	if len(includes) > 0 {
 		matched := false
 		for _, pattern := range includes {
+			// Error is impossible — patterns were validated in parseConfig.
 			if ok, _ := filepath.Match(pattern, name); ok {
 				matched = true
 				break
@@ -27,6 +28,7 @@ func shouldProcess(d fs.DirEntry, includes, excludes []string, minSize, maxSize 
 
 	// Exclude runs after include, further narrowing the set.
 	for _, pattern := range excludes {
+		// Error is impossible — patterns were validated in parseConfig.
 		if ok, _ := filepath.Match(pattern, name); ok {
 			return false, nil
 		}

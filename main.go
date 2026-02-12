@@ -28,6 +28,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -289,6 +290,7 @@ func parseConfig() (appConfig, error) {
 			output:       *output,
 			algo:         *algo,
 			cache:        cache,
+			cacheMu:      &sync.Mutex{},
 			refresh:      *refresh,
 			cacheAgeDays: *cacheAge,
 			limiter:      limiter,
@@ -404,35 +406,9 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 			processFile(path)
 		}
 	} else {
-		err = filepath.WalkDir(arg, func(path string, d fs.DirEntry, walkErr error) error {
+		err = walkMatchingFiles(arg, sc, func(path string, _ fs.DirEntry) error {
 			if cfg.ctx.Err() != nil {
 				return cfg.ctx.Err()
-			}
-			if walkErr != nil {
-				fmt.Fprintln(os.Stderr, "Error:", path, walkErr)
-				return nil
-			}
-			if d.IsDir() {
-				if path != arg {
-					if skipDirs[d.Name()] {
-						return fs.SkipDir
-					}
-					if !sc.recursive {
-						return fs.SkipDir
-					}
-				}
-				return nil
-			}
-			if !d.Type().IsRegular() {
-				return nil
-			}
-			ok, filterErr := shouldProcess(d, sc.includes, sc.excludes, sc.minSize, sc.maxSize)
-			if filterErr != nil {
-				fmt.Fprintln(os.Stderr, "Warning:", path, filterErr)
-				return nil
-			}
-			if !ok {
-				return nil
 			}
 			processFile(path)
 			return nil
@@ -462,7 +438,11 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 		if malicious > 0 {
 			maliciousStr = color.RedString("%d", malicious)
 		}
-		fmt.Printf("Checked %d files, %d found in VirusTotal, %s malicious\n", looked, found, maliciousStr)
+		fileWord := "files"
+		if looked == 1 {
+			fileWord = "file"
+		}
+		fmt.Printf("Checked %d %s, %d found in VirusTotal, %s malicious\n", looked, fileWord, found, maliciousStr)
 	}
 
 	if malicious > 0 {
@@ -471,13 +451,14 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 	return 0
 }
 
-// collectMatchingFiles walks the directory tree once and returns paths
-// of all files that pass the dir-skip and shouldProcess() filters.
-func collectMatchingFiles(root string, sc scanConfig) ([]string, error) {
-	var files []string
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+// walkMatchingFiles walks root and calls fn for every regular file that
+// passes the dir-skip and scanConfig filters. It is the single place
+// where directory traversal + filtering logic lives.
+func walkMatchingFiles(root string, sc scanConfig, fn func(path string, d fs.DirEntry) error) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil // skip inaccessible entries
+			fmt.Fprintln(os.Stderr, "Warning:", path, err)
+			return nil
 		}
 		if d.IsDir() {
 			if path != root {
@@ -494,9 +475,22 @@ func collectMatchingFiles(root string, sc scanConfig) ([]string, error) {
 			return nil
 		}
 		ok, filterErr := shouldProcess(d, sc.includes, sc.excludes, sc.minSize, sc.maxSize)
-		if filterErr != nil || !ok {
+		if filterErr != nil {
+			fmt.Fprintln(os.Stderr, "Warning:", path, filterErr)
 			return nil
 		}
+		if !ok {
+			return nil
+		}
+		return fn(path, d)
+	})
+}
+
+// collectMatchingFiles walks the directory tree once and returns paths
+// of all files that pass the dir-skip and shouldProcess() filters.
+func collectMatchingFiles(root string, sc scanConfig) ([]string, error) {
+	var files []string
+	err := walkMatchingFiles(root, sc, func(path string, _ fs.DirEntry) error {
 		files = append(files, path)
 		return nil
 	})
