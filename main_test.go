@@ -25,89 +25,68 @@ func TestIsHexHash(t *testing.T) {
 	const emptyMD5 = "d41d8cd98f00b204e9800998ecf8427e"
 
 	tests := []struct {
-		name string
-		in   string
-		algo string
-		want bool
+		name     string
+		in       string
+		wantOK   bool
+		wantAlgo string
 	}{
 		{
-			name: "valid lowercase sha256",
-			in:   emptySHA256Lower,
-			algo: "sha256",
-			want: true,
+			name:     "valid lowercase sha256",
+			in:       emptySHA256Lower,
+			wantOK:   true,
+			wantAlgo: "sha256",
 		},
 		{
-			name: "valid uppercase sha256",
-			in:   emptySHA256Upper,
-			algo: "sha256",
-			want: true,
+			name:     "valid uppercase sha256",
+			in:       emptySHA256Upper,
+			wantOK:   true,
+			wantAlgo: "sha256",
 		},
 		{
-			name: "sha256 too short",
-			in:   "abc123",
-			algo: "sha256",
-			want: false,
+			name:   "too short",
+			in:     "abc123",
+			wantOK: false,
 		},
 		{
-			name: "sha256 too long",
-			in:   emptySHA256Lower + "0",
-			algo: "sha256",
-			want: false,
+			name:   "sha256 too long",
+			in:     emptySHA256Lower + "0",
+			wantOK: false,
 		},
 		{
-			name: "non-hex characters",
-			in:   "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
-			algo: "sha256",
-			want: false,
+			name:   "non-hex characters",
+			in:     "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+			wantOK: false,
 		},
 		{
-			name: "empty string",
-			in:   "",
-			algo: "sha256",
-			want: false,
+			name:   "empty string",
+			in:     "",
+			wantOK: false,
 		},
 		{
-			name: "md5 length rejected as sha256",
-			in:   emptyMD5,
-			algo: "sha256",
-			want: false,
+			name:     "valid sha1",
+			in:       emptySHA1,
+			wantOK:   true,
+			wantAlgo: "sha1",
 		},
 		{
-			name: "valid sha1",
-			in:   emptySHA1,
-			algo: "sha1",
-			want: true,
+			name:     "valid md5",
+			in:       emptyMD5,
+			wantOK:   true,
+			wantAlgo: "md5",
 		},
 		{
-			name: "sha256 hash rejected as sha1",
-			in:   emptySHA256Lower,
-			algo: "sha1",
-			want: false,
-		},
-		{
-			name: "valid md5",
-			in:   emptyMD5,
-			algo: "md5",
-			want: true,
-		},
-		{
-			name: "sha256 hash rejected as md5",
-			in:   emptySHA256Lower,
-			algo: "md5",
-			want: false,
-		},
-		{
-			name: "unsupported algorithm",
-			in:   emptySHA256Lower,
-			algo: "sha512",
-			want: false,
+			name:   "unknown length",
+			in:     "aabbccdd",
+			wantOK: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isHexHash(tt.in, tt.algo); got != tt.want {
-				t.Fatalf("isHexHash(%q, %q) = %v, want %v", tt.in, tt.algo, got, tt.want)
+			gotOK, gotAlgo := isHexHash(tt.in)
+			if gotOK != tt.wantOK || gotAlgo != tt.wantAlgo {
+				t.Fatalf("isHexHash(%q) = (%v, %q), want (%v, %q)",
+					tt.in, gotOK, gotAlgo, tt.wantOK, tt.wantAlgo)
 			}
 		})
 	}
@@ -116,86 +95,47 @@ func TestIsHexHash(t *testing.T) {
 func TestHashFile(t *testing.T) {
 	content := []byte("hashchecker test content")
 
-	t.Run("sha256 known content", func(t *testing.T) {
+	t.Run("all three hashes", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "testfile")
 		if err := os.WriteFile(path, content, 0o644); err != nil {
 			t.Fatalf("writing temp file: %v", err)
 		}
-		sum := sha256.Sum256(content)
-		want := hex.EncodeToString(sum[:])
-		got, err := hashFile(path, "sha256")
+		sum256 := sha256.Sum256(content)
+		sum1 := sha1.Sum(content)
+		sumMD5 := md5.Sum(content)
+
+		got, err := hashFile(path)
 		if err != nil {
 			t.Fatalf("hashFile() error: %v", err)
 		}
-		if got != want {
-			t.Fatalf("hashFile() = %q, want %q", got, want)
+		if want := hex.EncodeToString(sum256[:]); got.SHA256 != want {
+			t.Fatalf("SHA256 = %q, want %q", got.SHA256, want)
+		}
+		if want := hex.EncodeToString(sum1[:]); got.SHA1 != want {
+			t.Fatalf("SHA1 = %q, want %q", got.SHA1, want)
+		}
+		if want := hex.EncodeToString(sumMD5[:]); got.MD5 != want {
+			t.Fatalf("MD5 = %q, want %q", got.MD5, want)
 		}
 	})
 
-	t.Run("sha256 empty file", func(t *testing.T) {
+	t.Run("empty file", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "empty")
 		if err := os.WriteFile(path, []byte{}, 0o644); err != nil {
 			t.Fatalf("writing temp file: %v", err)
 		}
-		sum := sha256.Sum256([]byte{})
-		want := hex.EncodeToString(sum[:])
-		got, err := hashFile(path, "sha256")
+		sum256 := sha256.Sum256([]byte{})
+		got, err := hashFile(path)
 		if err != nil {
 			t.Fatalf("hashFile() error: %v", err)
 		}
-		if got != want {
-			t.Fatalf("hashFile() = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("sha1 known content", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "testfile")
-		if err := os.WriteFile(path, content, 0o644); err != nil {
-			t.Fatalf("writing temp file: %v", err)
-		}
-		sum := sha1.Sum(content)
-		want := hex.EncodeToString(sum[:])
-		got, err := hashFile(path, "sha1")
-		if err != nil {
-			t.Fatalf("hashFile() error: %v", err)
-		}
-		if got != want {
-			t.Fatalf("hashFile() = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("md5 known content", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "testfile")
-		if err := os.WriteFile(path, content, 0o644); err != nil {
-			t.Fatalf("writing temp file: %v", err)
-		}
-		sum := md5.Sum(content)
-		want := hex.EncodeToString(sum[:])
-		got, err := hashFile(path, "md5")
-		if err != nil {
-			t.Fatalf("hashFile() error: %v", err)
-		}
-		if got != want {
-			t.Fatalf("hashFile() = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("unsupported algorithm", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "testfile")
-		if err := os.WriteFile(path, content, 0o644); err != nil {
-			t.Fatalf("writing temp file: %v", err)
-		}
-		_, err := hashFile(path, "sha512")
-		if err == nil {
-			t.Fatal("hashFile() should return error for unsupported algorithm")
-		}
-		if !strings.Contains(err.Error(), "unsupported algorithm") {
-			t.Fatalf("error %q should mention unsupported algorithm", err.Error())
+		if want := hex.EncodeToString(sum256[:]); got.SHA256 != want {
+			t.Fatalf("SHA256 = %q, want %q", got.SHA256, want)
 		}
 	})
 
 	t.Run("nonexistent file", func(t *testing.T) {
-		_, err := hashFile(filepath.Join(t.TempDir(), "does-not-exist"), "sha256")
+		_, err := hashFile(filepath.Join(t.TempDir(), "does-not-exist"))
 		if err == nil {
 			t.Fatal("hashFile() should return error for nonexistent file")
 		}
@@ -670,9 +610,9 @@ func TestRunHashLookupMD5(t *testing.T) {
 	srv := startMockVT(t)
 	defer srv.Close()
 
-	// Valid MD5 hash (of empty file)
+	// Valid MD5 hash (of empty file) — algo is auto-detected from length
 	hash := "d41d8cd98f00b204e9800998ecf8427e"
-	code, stdout := callRun(t, "-no-cache", "-algo", "md5", hash)
+	code, stdout := callRun(t, "-no-cache", hash)
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}

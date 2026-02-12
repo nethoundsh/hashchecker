@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -9,15 +10,20 @@ import (
 )
 
 func TestPrintJSON(t *testing.T) {
-	t.Run("with path", func(t *testing.T) {
+	t.Run("file input with all hashes", func(t *testing.T) {
 		vt := VirusTotalResult{
 			Found: true, Name: "test.exe", Malicious: 5, Harmless: 50,
 		}
-		stdout := captureStdout(t, func() {
-			if err := printJSON("/tmp/test.exe", "abc123", "sha256", vt); err != nil {
-				t.Fatalf("printJSON error: %v", err)
-			}
-		})
+		hashes := &hashResult{
+			SHA256: "abc123sha256",
+			SHA1:   "abc123sha1",
+			MD5:    "abc123md5",
+		}
+		var buf bytes.Buffer
+		if err := printJSON(&buf, "/tmp/test.exe", "abc123sha256", "sha256", vt, hashes); err != nil {
+			t.Fatalf("printJSON error: %v", err)
+		}
+		stdout := buf.String()
 
 		var rec jsonRecord
 		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rec); err != nil {
@@ -26,42 +32,57 @@ func TestPrintJSON(t *testing.T) {
 		if rec.Path != "/tmp/test.exe" {
 			t.Fatalf("Path = %q, want %q", rec.Path, "/tmp/test.exe")
 		}
-		if rec.Hash != "abc123" {
-			t.Fatalf("Hash = %q, want %q", rec.Hash, "abc123")
+		if rec.LookupHash != "abc123sha256" {
+			t.Fatalf("LookupHash = %q, want %q", rec.LookupHash, "abc123sha256")
 		}
-		if rec.Algorithm != "sha256" {
-			t.Fatalf("Algorithm = %q, want %q", rec.Algorithm, "sha256")
+		if rec.LookupAlgo != "sha256" {
+			t.Fatalf("LookupAlgo = %q, want %q", rec.LookupAlgo, "sha256")
+		}
+		if rec.Hashes.SHA256 != "abc123sha256" {
+			t.Fatalf("Hashes.SHA256 = %q, want %q", rec.Hashes.SHA256, "abc123sha256")
+		}
+		if rec.Hashes.SHA1 != "abc123sha1" {
+			t.Fatalf("Hashes.SHA1 = %q, want %q", rec.Hashes.SHA1, "abc123sha1")
+		}
+		if rec.Hashes.MD5 != "abc123md5" {
+			t.Fatalf("Hashes.MD5 = %q, want %q", rec.Hashes.MD5, "abc123md5")
 		}
 		if rec.Result.Malicious != 5 {
 			t.Fatalf("Result.Malicious = %d, want 5", rec.Result.Malicious)
 		}
 	})
 
-	t.Run("without path omits field", func(t *testing.T) {
+	t.Run("raw hash input (nil hashes)", func(t *testing.T) {
 		vt := VirusTotalResult{Found: true, Name: "raw.bin"}
-		stdout := captureStdout(t, func() {
-			if err := printJSON("", "def456", "md5", vt); err != nil {
-				t.Fatalf("printJSON error: %v", err)
-			}
-		})
+		var buf bytes.Buffer
+		if err := printJSON(&buf, "", "def456", "md5", vt, nil); err != nil {
+			t.Fatalf("printJSON error: %v", err)
+		}
+		stdout := buf.String()
 
+		var rec jsonRecord
+		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rec); err != nil {
+			t.Fatalf("invalid JSON output: %v\nraw: %s", err, stdout)
+		}
 		// The "path" key should be absent (omitempty)
 		if strings.Contains(stdout, `"path"`) {
 			t.Fatalf("expected path to be omitted, got: %s", stdout)
 		}
-		// Algorithm field should be present
-		if !strings.Contains(stdout, `"algorithm":"md5"`) {
-			t.Fatalf("expected algorithm field, got: %s", stdout)
+		if rec.LookupAlgo != "md5" {
+			t.Fatalf("LookupAlgo = %q, want %q", rec.LookupAlgo, "md5")
+		}
+		if rec.Hashes.MD5 != "def456" {
+			t.Fatalf("Hashes.MD5 = %q, want %q", rec.Hashes.MD5, "def456")
 		}
 	})
 }
 
 func TestPrintJSONSummary(t *testing.T) {
-	stdout := captureStdout(t, func() {
-		if err := printJSONSummary("/tmp/dir", 10, 8, 3); err != nil {
-			t.Fatalf("printJSONSummary error: %v", err)
-		}
-	})
+	var buf bytes.Buffer
+	if err := printJSONSummary(&buf, "/tmp/dir", 10, 8, 3); err != nil {
+		t.Fatalf("printJSONSummary error: %v", err)
+	}
+	stdout := buf.String()
 
 	var rec jsonSummaryRecord
 	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rec); err != nil {
@@ -87,32 +108,46 @@ func TestPrintResult(t *testing.T) {
 	color.NoColor = true
 	defer func() { color.NoColor = oldNoColor }()
 
-	t.Run("found with details", func(t *testing.T) {
+	t.Run("file input with all hashes", func(t *testing.T) {
 		vt := VirusTotalResult{
 			Found: true, Name: "malware.exe", Reputation: -5,
 			Malicious: 42, Suspicious: 3, Undetected: 10, Harmless: 50,
 			ThreatLabel: "trojan.generic",
 		}
-		stdout := captureStdout(t, func() {
-			printResult("abc123", "sha256", vt)
-		})
-		for _, want := range []string{"abc123", "SHA-256", "malware.exe", "-5", "42", "trojan.generic"} {
+		hashes := &hashResult{
+			SHA256: "abc123sha256",
+			SHA1:   "abc123sha1",
+			MD5:    "abc123md5",
+		}
+		var buf bytes.Buffer
+		printResult(&buf, "abc123sha256", "sha256", vt, hashes)
+		stdout := buf.String()
+		for _, want := range []string{
+			"abc123sha256", "abc123sha1", "abc123md5",
+			"SHA-256", "SHA-1", "MD5",
+			"malware.exe", "-5", "42", "trojan.generic",
+			"*",
+		} {
 			if !strings.Contains(stdout, want) {
 				t.Errorf("output missing %q\ngot: %s", want, stdout)
 			}
 		}
 	})
 
-	t.Run("not found", func(t *testing.T) {
+	t.Run("raw hash input (nil hashes)", func(t *testing.T) {
 		vt := VirusTotalResult{Found: false}
-		stdout := captureStdout(t, func() {
-			printResult("def456", "sha1", vt)
-		})
+		var buf bytes.Buffer
+		printResult(&buf, "def456", "sha1", vt, nil)
+		stdout := buf.String()
 		if !strings.Contains(stdout, "Not found") {
 			t.Fatalf("expected 'Not found' message, got: %s", stdout)
 		}
 		if !strings.Contains(stdout, "SHA-1") {
 			t.Fatalf("expected 'SHA-1' label, got: %s", stdout)
+		}
+		// Raw hash input should NOT show multi-hash format
+		if strings.Contains(stdout, "SHA-256") {
+			t.Fatalf("raw hash should not show SHA-256 line, got: %s", stdout)
 		}
 	})
 }

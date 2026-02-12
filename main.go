@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/sha1"
@@ -20,7 +21,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"hash"
 	"io"
 	"io/fs"
 	"net/http"
@@ -34,7 +34,8 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/fatih/color"
 	"github.com/mattn/go-isatty"
-	"github.com/schollz/progressbar/v3"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 	"golang.org/x/time/rate"
 )
 
@@ -48,6 +49,27 @@ var version = "dev"
 var skipDirs = map[string]bool{
 	".git": true, "node_modules": true, "__pycache__": true,
 	"vendor": true, ".venv": true, ".idea": true, ".vscode": true,
+}
+
+// hashResult holds all three hash digests computed from a single file read.
+type hashResult struct {
+	SHA256 string
+	SHA1   string
+	MD5    string
+}
+
+// ForAlgo returns the hash for the given algorithm name.
+func (h hashResult) ForAlgo(algo string) string {
+	switch algo {
+	case "sha256":
+		return h.SHA256
+	case "sha1":
+		return h.SHA1
+	case "md5":
+		return h.MD5
+	default:
+		return h.SHA256
+	}
 }
 
 type scanConfig struct {
@@ -96,8 +118,8 @@ func run() int {
 	defer cfg.stop()
 	defer cfg.flushCache()
 
-	if isHexHash(cfg.arg, cfg.lookupCfg.algo) {
-		return runHash(cfg.arg, cfg.lookupCfg)
+	if ok, detectedAlgo := isHexHash(cfg.arg); ok {
+		return runHash(cfg.arg, detectedAlgo, cfg.lookupCfg)
 	}
 	fi, err := os.Stat(cfg.arg)
 	if err != nil {
@@ -122,7 +144,7 @@ func parseConfig() (appConfig, error) {
 	refresh := flag.Bool("refresh", false, "ignore cached results but still write new ones")
 	cacheAge := flag.Int("cache-age", 7, "maximum age of cached results in days")
 	recursive := flag.Bool("r", false, "recursively scan subdirectories")
-	algo := flag.String("algo", "sha256", "hash algorithm: sha256, sha1, or md5")
+	algo := flag.String("algo", "sha256", "hash algorithm for VirusTotal lookup: sha256, sha1, or md5")
 	showVersion := flag.Bool("version", false, "print version and exit")
 
 	include := flag.String("include", "", "comma-separated glob patterns — only process matching files (e.g. \"*.exe,*.dll\")")
@@ -316,14 +338,15 @@ func parseConfig() (appConfig, error) {
 
 // Exit codes: 0 = clean, 1 = error, 2 = malicious file(s) found.
 
-func runHash(arg string, cfg lookupConfig) int {
+func runHash(arg, detectedAlgo string, cfg lookupConfig) int {
+	cfg.algo = detectedAlgo
 	hash := strings.ToLower(arg)
 	result, err := lookup(hash, cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
-	if err := printLookupResult("", hash, cfg, result); err != nil {
+	if err := printLookupResult(os.Stdout, "", hash, cfg, result, nil); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
@@ -337,17 +360,25 @@ func runHash(arg string, cfg lookupConfig) int {
 // With showProgress, files are collected first to get a total for the bar.
 func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int {
 	var looked, found, malicious int
-	var bar *progressbar.ProgressBar
+	var progress *mpb.Progress
+	var bar *mpb.Bar
 
 	processFile := func(path string) {
-		hash, err := hashFile(path, cfg.algo)
+		hashes, err := hashFile(path)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", path, err)
 			return
 		}
+		hash := hashes.ForAlgo(cfg.algo)
+
+		var w io.Writer = os.Stdout
+		var buf bytes.Buffer
+		if progress != nil {
+			w = &buf
+		}
 
 		if cfg.output == "text" {
-			fmt.Println(color.HiBlueString("--- %s ---", path))
+			fmt.Fprintln(w, color.HiBlueString("--- %s ---", path))
 		}
 
 		result, err := lookup(hash, cfg)
@@ -355,9 +386,13 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			return
 		}
-		if err := printLookupResult(path, hash, cfg, result); err != nil {
+		if err := printLookupResult(w, path, hash, cfg, result, &hashes); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			return
+		}
+
+		if progress != nil {
+			_, _ = progress.Write(buf.Bytes())
 		}
 
 		looked++
@@ -369,7 +404,7 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 		}
 
 		if bar != nil {
-			_ = bar.Add(1)
+			bar.Increment()
 		}
 	}
 
@@ -382,21 +417,15 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 		}
 
 		if len(files) > 0 {
-			bar = progressbar.NewOptions(len(files),
-				progressbar.OptionSetWriter(os.Stderr),
-				progressbar.OptionSetDescription("Scanning"),
-				progressbar.OptionShowCount(),
-				progressbar.OptionShowIts(),
-				progressbar.OptionSetItsString("files"),
-				progressbar.OptionClearOnFinish(),
-				progressbar.OptionSetPredictTime(true),
-				progressbar.OptionSetTheme(progressbar.Theme{
-					Saucer:        "=",
-					SaucerHead:    ">",
-					SaucerPadding: " ",
-					BarStart:      "[",
-					BarEnd:        "]",
-				}),
+			progress = mpb.NewWithContext(cfg.ctx, mpb.WithOutput(os.Stderr))
+			bar = progress.New(int64(len(files)),
+				mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding(" ").Rbound("]"),
+				mpb.PrependDecorators(decor.Name("Scanning ")),
+				mpb.AppendDecorators(
+					decor.CountersNoUnit(" %d / %d "),
+					decor.AverageETA(decor.ET_STYLE_MMSS),
+				),
+				mpb.BarRemoveOnComplete(),
 			)
 		}
 
@@ -417,8 +446,8 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 		})
 	}
 
-	if bar != nil {
-		_ = bar.Finish()
+	if progress != nil {
+		progress.Wait()
 	}
 
 	if err != nil {
@@ -431,7 +460,7 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 	}
 
 	if cfg.output == "json" {
-		if err := printJSONSummary(arg, looked, found, malicious); err != nil {
+		if err := printJSONSummary(os.Stdout, arg, looked, found, malicious); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			return 1
 		}
@@ -444,7 +473,7 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 		if looked == 1 {
 			fileWord = "file"
 		}
-		fmt.Printf("Checked %d %s, %d found in VirusTotal, %s malicious\n", looked, fileWord, found, maliciousStr)
+		fmt.Fprintf(os.Stdout, "Checked %d %s, %d found in VirusTotal, %s malicious\n", looked, fileWord, found, maliciousStr)
 	}
 
 	if malicious > 0 {
@@ -516,17 +545,18 @@ func runFile(arg string, fi os.FileInfo, cfg lookupConfig, sc scanConfig) int {
 		}
 	}
 
-	hash, err := hashFile(arg, cfg.algo)
+	hashes, err := hashFile(arg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
+	hash := hashes.ForAlgo(cfg.algo)
 	result, err := lookup(hash, cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
-	if err := printLookupResult(arg, hash, cfg, result); err != nil {
+	if err := printLookupResult(os.Stdout, arg, hash, cfg, result, &hashes); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
@@ -536,30 +566,33 @@ func runFile(arg string, fi os.FileInfo, cfg lookupConfig, sc scanConfig) int {
 	return 0
 }
 
-// isHexHash reports whether s is a valid hex hash for the given algorithm.
-func isHexHash(s, algo string) bool {
+// isHexHash reports whether s is a valid hex-encoded hash and, if so,
+// which algorithm it matches based on decoded byte length:
+// 32 bytes = sha256, 20 = sha1, 16 = md5.
+func isHexHash(s string) (bool, string) {
 	b, err := hex.DecodeString(s)
 	if err != nil {
-		return false
+		return false, ""
 	}
-	switch algo {
-	case "sha256":
-		return len(b) == 32
-	case "sha1":
-		return len(b) == 20
-	case "md5":
-		return len(b) == 16
+	switch len(b) {
+	case 32:
+		return true, "sha256"
+	case 20:
+		return true, "sha1"
+	case 16:
+		return true, "md5"
 	default:
-		return false
+		return false, ""
 	}
 }
 
-// hashFile computes the hash of filePath and returns it as a lowercase hex string.
-// It streams the file through io.Copy to avoid loading it entirely into memory.
-func hashFile(filePath, algo string) (_ string, err error) {
+// hashFile computes SHA-256, SHA-1, and MD5 of filePath in a single pass
+// using io.MultiWriter. Disk I/O dominates, so computing all three costs
+// essentially the same as one.
+func hashFile(filePath string) (_ hashResult, err error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return "", fmt.Errorf("hashing: %w", err) // os.Open already includes the path
+		return hashResult{}, fmt.Errorf("hashing: %w", err)
 	}
 	defer func() {
 		if closeErr := file.Close(); closeErr != nil && err == nil {
@@ -567,20 +600,16 @@ func hashFile(filePath, algo string) (_ string, err error) {
 		}
 	}()
 
-	var h hash.Hash
-	switch algo {
-	case "sha256":
-		h = sha256.New()
-	case "sha1":
-		h = sha1.New()
-	case "md5":
-		h = md5.New()
-	default:
-		return "", fmt.Errorf("unsupported algorithm: %s", algo)
+	h256 := sha256.New()
+	h1 := sha1.New()
+	hMD5 := md5.New()
+
+	if _, err = io.Copy(io.MultiWriter(h256, h1, hMD5), file); err != nil {
+		return hashResult{}, fmt.Errorf("hashing %s: %w", filePath, err)
 	}
-	_, err = io.Copy(h, file)
-	if err != nil {
-		return "", fmt.Errorf("hashing %s: %w", filePath, err)
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hashResult{
+		SHA256: hex.EncodeToString(h256.Sum(nil)),
+		SHA1:   hex.EncodeToString(h1.Sum(nil)),
+		MD5:    hex.EncodeToString(hMD5.Sum(nil)),
+	}, nil
 }

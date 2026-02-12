@@ -3,17 +3,25 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 
 	"github.com/fatih/color"
 )
 
 // NDJSON output: each line is a self-contained JSON object.
 
+type jsonHashes struct {
+	SHA256 string `json:"sha256,omitempty"`
+	SHA1   string `json:"sha1,omitempty"`
+	MD5    string `json:"md5,omitempty"`
+}
+
 type jsonRecord struct {
-	Path      string           `json:"path,omitempty"` // file path (empty for raw hash lookups)
-	Hash      string           `json:"hash"`           // hash in hex
-	Algorithm string           `json:"algorithm"`      // hash algorithm used (e.g. "sha256")
-	Result    VirusTotalResult `json:"result"`         // full VT result
+	Path       string           `json:"path,omitempty"`
+	Hashes     jsonHashes       `json:"hashes"`
+	LookupHash string           `json:"lookup_hash"`
+	LookupAlgo string           `json:"lookup_algorithm"`
+	Result     VirusTotalResult `json:"result"`
 }
 
 type jsonSummary struct {
@@ -30,33 +38,51 @@ type jsonSummaryRecord struct {
 }
 
 // printLookupResult prints a single lookup result in the configured format.
-func printLookupResult(path, hash string, cfg lookupConfig, result VirusTotalResult) error {
+// hashes is non-nil for file input (shows all three) and nil for raw hash input.
+func printLookupResult(w io.Writer, path, hash string, cfg lookupConfig, result VirusTotalResult, hashes *hashResult) error {
 	switch cfg.output {
 	case "json":
-		return printJSON(path, hash, cfg.algo, result)
+		return printJSON(w, path, hash, cfg.algo, result, hashes)
 	default:
-		printResult(hash, cfg.algo, result)
+		printResult(w, hash, cfg.algo, result, hashes)
 		return nil
 	}
 }
 
 // printJSON emits a single NDJSON line for one file result.
-func printJSON(path, hash, algo string, vtResult VirusTotalResult) error {
+// hashes is non-nil for file input, nil for raw hash input.
+func printJSON(w io.Writer, path, hash, algo string, vtResult VirusTotalResult, hashes *hashResult) error {
 	rec := jsonRecord{
-		Path:      path,
-		Hash:      hash,
-		Algorithm: algo,
-		Result:    vtResult,
+		Path:       path,
+		LookupHash: hash,
+		LookupAlgo: algo,
+		Result:     vtResult,
+	}
+	if hashes != nil {
+		rec.Hashes = jsonHashes{
+			SHA256: hashes.SHA256,
+			SHA1:   hashes.SHA1,
+			MD5:    hashes.MD5,
+		}
+	} else {
+		switch algo {
+		case "sha256":
+			rec.Hashes = jsonHashes{SHA256: hash}
+		case "sha1":
+			rec.Hashes = jsonHashes{SHA1: hash}
+		case "md5":
+			rec.Hashes = jsonHashes{MD5: hash}
+		}
 	}
 	b, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("marshaling JSON output: %w", err)
 	}
-	fmt.Println(string(b))
+	fmt.Fprintln(w, string(b))
 	return nil
 }
 
-func printJSONSummary(path string, scanned, found, malicious int) error {
+func printJSONSummary(w io.Writer, path string, scanned, found, malicious int) error {
 	rec := jsonSummaryRecord{
 		Summary: jsonSummary{
 			Path:      path,
@@ -69,36 +95,57 @@ func printJSONSummary(path string, scanned, found, malicious int) error {
 	if err != nil {
 		return fmt.Errorf("marshaling JSON summary: %w", err)
 	}
-	fmt.Println(string(b))
+	fmt.Fprintln(w, string(b))
 	return nil
 }
 
-// printResult renders a color-coded summary. Labels are left-aligned
-// in a 16-char column for neat alignment.
-func printResult(hash, algo string, vtResult VirusTotalResult) {
-	label := "Hash (" + algoLabel(algo) + "):"
-	fmt.Printf("%-16s%s\n", label, color.CyanString(hash))
+// printResult renders a color-coded summary. When hashes is non-nil (file
+// input), all three hash lines are shown with a * marking the VT lookup hash.
+// When nil (raw hash input), a single hash line is printed.
+func printResult(w io.Writer, hash, algo string, vtResult VirusTotalResult, hashes *hashResult) {
+	if hashes != nil {
+		printHashLine(w, "SHA-256", hashes.SHA256, algo == "sha256")
+		printHashLine(w, "SHA-1", hashes.SHA1, algo == "sha1")
+		printHashLine(w, "MD5", hashes.MD5, algo == "md5")
+	} else {
+		label := "Hash (" + algoLabel(algo) + "):"
+		fmt.Fprintf(w, "%-16s%s\n", label, color.CyanString(hash))
+	}
+
+	fmt.Fprintln(w)
 
 	if !vtResult.Found {
-		fmt.Println(color.YellowString("Not found in VirusTotal"))
+		fmt.Fprintln(w, color.YellowString("Not found in VirusTotal"))
 		return
 	}
 
-	fmt.Printf("%-16s%s\n", "Name:", vtResult.Name)
-	fmt.Printf("%-16s%s\n", "Reputation:", repColorInt(vtResult.Reputation))
-	fmt.Printf("%-16s%s\n", "Malicious:", redOrGreenInt(vtResult.Malicious))
-	fmt.Printf("%-16s%s\n", "Suspicious:", yellowOrGreenInt(vtResult.Suspicious))
-	fmt.Printf("%-16s%s\n", "Undetected:", yellowOrGreenInt(vtResult.Undetected))
-	fmt.Printf("%-16s%s\n", "Harmless:", color.GreenString("%d", vtResult.Harmless))
+	fmt.Fprintf(w, "%-16s%s\n", "Name:", vtResult.Name)
+	fmt.Fprintf(w, "%-16s%s\n", "Reputation:", repColorInt(vtResult.Reputation))
+	fmt.Fprintln(w)
+
+	fmt.Fprintf(w, "%-16s%s\n", "Malicious:", redOrGreenInt(vtResult.Malicious))
+	fmt.Fprintf(w, "%-16s%s\n", "Suspicious:", yellowOrGreenInt(vtResult.Suspicious))
+	fmt.Fprintf(w, "%-16s%s\n", "Undetected:", yellowOrGreenInt(vtResult.Undetected))
+	fmt.Fprintf(w, "%-16s%s\n", "Harmless:", color.GreenString("%d", vtResult.Harmless))
+	fmt.Fprintln(w)
 
 	switch {
 	case vtResult.ThreatLabel == "":
-		fmt.Printf("%-16s%s\n", "Threat:", "None")
+		fmt.Fprintf(w, "%-16s%s\n", "Threat:", "None")
 	case vtResult.Malicious > 0:
-		fmt.Printf("%-16s%s\n", "Threat:", color.RedString("%s", vtResult.ThreatLabel))
+		fmt.Fprintf(w, "%-16s%s\n", "Threat:", color.RedString("%s", vtResult.ThreatLabel))
 	default:
-		fmt.Printf("%-16s%s\n", "Threat:", vtResult.ThreatLabel)
+		fmt.Fprintf(w, "%-16s%s\n", "Threat:", vtResult.ThreatLabel)
 	}
+}
+
+// printHashLine prints one hash line. The VT lookup hash is marked with *.
+func printHashLine(w io.Writer, label, hash string, isVTLookup bool) {
+	prefix := "  "
+	if isVTLookup {
+		prefix = "* "
+	}
+	fmt.Fprintf(w, "%s%-14s%s\n", prefix, label+":", color.CyanString(hash))
 }
 
 func algoLabel(algo string) string {
@@ -136,4 +183,3 @@ func yellowOrGreenInt(n int) string {
 	}
 	return color.GreenString("%d", n)
 }
-

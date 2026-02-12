@@ -7,8 +7,8 @@ A command-line tool that computes file hashes and checks them against the [Virus
 - **Multi-hash support** — SHA-256 (default), SHA-1, and MD5 via the `-algo` flag. Files are streamed through `hash.Hash` so even large files are hashed without loading them entirely into memory.
 - **VirusTotal lookup** — queries the VirusTotal v3 API and reports malicious/suspicious/undetected/harmless engine counts, reputation score, and threat classification. The API natively accepts SHA-256, SHA-1, and MD5 hashes.
 - **Direct hash lookup** — pass a hex hash string instead of a file path to look up a hash you already have (64 chars for SHA-256, 40 for SHA-1, 32 for MD5).
-- **Directory scanning** — point it at a directory to scan all regular files (symlinks are skipped). Use `-r` for recursive scanning with automatic skipping of common non-essential directories (`.git`, `node_modules`, `__pycache__`, `vendor`, etc.). A progress bar shows file count, percentage, throughput, and ETA for long-running scans.
-- **Progress bar** — directory scans display a live progress bar on stderr with percentage, file count, throughput (files/s), and ETA. Automatically suppressed in JSON mode, when stderr is not a TTY (piped/redirected), or when `-no-progress` is passed.
+- **Directory scanning** — point it at a directory to scan all regular files (symlinks are skipped). Use `-r` for recursive scanning with automatic skipping of common non-essential directories (`.git`, `node_modules`, `__pycache__`, `vendor`, etc.). A bottom-anchored progress bar shows file count and ETA while per-file results scroll above it.
+- **Progress bar** — directory scans display a bottom-anchored progress bar on stderr with file count and ETA. Per-file results scroll above the bar so it always stays at the bottom of the terminal. Automatically suppressed in JSON mode, when stderr is not a TTY (piped/redirected), or when `-no-progress` is passed.
 - **File filtering** — narrow which files get scanned with glob patterns (`-include`, `-exclude`) and size limits (`-min-size`, `-max-size`). Filters are applied before hashing, so excluded files don't waste CPU or API quota.
 - **Rate limiting** — the `-free` flag enforces VirusTotal's free-tier limit (4 requests/minute), or use `-rate N` for custom pacing. Uses a token-bucket limiter with random jitter to avoid bot detection.
 - **Colored output** — malicious results in red, suspicious in yellow, clean in green. Disable with `-no-color` or the `NO_COLOR` environment variable.
@@ -165,7 +165,7 @@ hashchecker -algo sha1 -r ~/Downloads
 hashchecker -free ~/Downloads
 ```
 
-Scans every regular file in the directory (non-recursive by default). With `-free`, requests are paced at 4 per minute using a token-bucket limiter. A progress bar on stderr shows scan progress, ETA, and throughput.
+Scans every regular file in the directory (non-recursive by default). With `-free`, requests are paced at 4 per minute using a token-bucket limiter. A bottom-anchored progress bar on stderr shows scan progress and ETA while per-file results scroll above it.
 
 To disable the progress bar:
 
@@ -423,7 +423,7 @@ go test -cover ./...
 | [`github.com/dustin/go-humanize`](https://github.com/dustin/go-humanize) | Parse human-readable file sizes (`"10MB"` to bytes) |
 | [`github.com/fatih/color`](https://github.com/fatih/color) | ANSI-colored terminal output |
 | [`github.com/mattn/go-isatty`](https://github.com/mattn/go-isatty) | Detect whether a file descriptor is a terminal (TTY) |
-| [`github.com/schollz/progressbar/v3`](https://github.com/schollz/progressbar) | Terminal progress bar with ETA and throughput display |
+| [`github.com/vbauerster/mpb/v8`](https://github.com/vbauerster/mpb) | Bottom-anchored terminal progress bar with ETA display |
 | [`golang.org/x/time/rate`](https://pkg.go.dev/golang.org/x/time/rate) | Token-bucket rate limiter for API call pacing |
 
 ## License
