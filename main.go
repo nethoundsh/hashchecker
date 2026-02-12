@@ -378,7 +378,7 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 		}
 
 		if cfg.output == "text" {
-			fmt.Fprintln(w, color.HiBlueString("--- %s ---", path))
+			_, _ = fmt.Fprintln(w, color.HiBlueString("--- %s ---", path))
 		}
 
 		result, err := lookup(hash, cfg)
@@ -473,7 +473,7 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 		if looked == 1 {
 			fileWord = "file"
 		}
-		fmt.Fprintf(os.Stdout, "Checked %d %s, %d found in VirusTotal, %s malicious\n", looked, fileWord, found, maliciousStr)
+		_, _ = fmt.Fprintf(os.Stdout, "Checked %d %s, %d found in VirusTotal, %s malicious\n", looked, fileWord, found, maliciousStr)
 	}
 
 	if malicious > 0 {

@@ -120,7 +120,9 @@ func TestPrintResult(t *testing.T) {
 			MD5:    "abc123md5",
 		}
 		var buf bytes.Buffer
-		printResult(&buf, "abc123sha256", "sha256", vt, hashes)
+		if err := printResult(&buf, "abc123sha256", "sha256", vt, hashes); err != nil {
+			t.Fatalf("printResult error: %v", err)
+		}
 		stdout := buf.String()
 		for _, want := range []string{
 			"abc123sha256", "abc123sha1", "abc123md5",
@@ -137,7 +139,9 @@ func TestPrintResult(t *testing.T) {
 	t.Run("raw hash input (nil hashes)", func(t *testing.T) {
 		vt := VirusTotalResult{Found: false}
 		var buf bytes.Buffer
-		printResult(&buf, "def456", "sha1", vt, nil)
+		if err := printResult(&buf, "def456", "sha1", vt, nil); err != nil {
+			t.Fatalf("printResult error: %v", err)
+		}
 		stdout := buf.String()
 		if !strings.Contains(stdout, "Not found") {
 			t.Fatalf("expected 'Not found' message, got: %s", stdout)

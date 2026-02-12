@@ -37,6 +37,26 @@ type jsonSummaryRecord struct {
 	Summary jsonSummary `json:"summary"`
 }
 
+// errWriter captures the first write error, allowing a sequence of
+// fmt calls without checking each one individually. This is the same
+// pattern used by bufio.Writer and the standard library's encoders.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (ew *errWriter) printf(format string, a ...any) {
+	if ew.err == nil {
+		_, ew.err = fmt.Fprintf(ew.w, format, a...)
+	}
+}
+
+func (ew *errWriter) println(a ...any) {
+	if ew.err == nil {
+		_, ew.err = fmt.Fprintln(ew.w, a...)
+	}
+}
+
 // printLookupResult prints a single lookup result in the configured format.
 // hashes is non-nil for file input (shows all three) and nil for raw hash input.
 func printLookupResult(w io.Writer, path, hash string, cfg lookupConfig, result VirusTotalResult, hashes *hashResult) error {
@@ -44,8 +64,7 @@ func printLookupResult(w io.Writer, path, hash string, cfg lookupConfig, result 
 	case "json":
 		return printJSON(w, path, hash, cfg.algo, result, hashes)
 	default:
-		printResult(w, hash, cfg.algo, result, hashes)
-		return nil
+		return printResult(w, hash, cfg.algo, result, hashes)
 	}
 }
 
@@ -78,8 +97,8 @@ func printJSON(w io.Writer, path, hash, algo string, vtResult VirusTotalResult, 
 	if err != nil {
 		return fmt.Errorf("marshaling JSON output: %w", err)
 	}
-	fmt.Fprintln(w, string(b))
-	return nil
+	_, err = fmt.Fprintln(w, string(b))
+	return err
 }
 
 func printJSONSummary(w io.Writer, path string, scanned, found, malicious int) error {
@@ -95,57 +114,61 @@ func printJSONSummary(w io.Writer, path string, scanned, found, malicious int) e
 	if err != nil {
 		return fmt.Errorf("marshaling JSON summary: %w", err)
 	}
-	fmt.Fprintln(w, string(b))
-	return nil
+	_, err = fmt.Fprintln(w, string(b))
+	return err
 }
 
 // printResult renders a color-coded summary. When hashes is non-nil (file
 // input), all three hash lines are shown with a * marking the VT lookup hash.
 // When nil (raw hash input), a single hash line is printed.
-func printResult(w io.Writer, hash, algo string, vtResult VirusTotalResult, hashes *hashResult) {
+func printResult(w io.Writer, hash, algo string, vtResult VirusTotalResult, hashes *hashResult) error {
+	ew := &errWriter{w: w}
+
 	if hashes != nil {
-		printHashLine(w, "SHA-256", hashes.SHA256, algo == "sha256")
-		printHashLine(w, "SHA-1", hashes.SHA1, algo == "sha1")
-		printHashLine(w, "MD5", hashes.MD5, algo == "md5")
+		printHashLine(ew, "SHA-256", hashes.SHA256, algo == "sha256")
+		printHashLine(ew, "SHA-1", hashes.SHA1, algo == "sha1")
+		printHashLine(ew, "MD5", hashes.MD5, algo == "md5")
 	} else {
 		label := "Hash (" + algoLabel(algo) + "):"
-		fmt.Fprintf(w, "%-16s%s\n", label, color.CyanString(hash))
+		ew.printf("%-16s%s\n", label, color.CyanString(hash))
 	}
 
-	fmt.Fprintln(w)
+	ew.println()
 
 	if !vtResult.Found {
-		fmt.Fprintln(w, color.YellowString("Not found in VirusTotal"))
-		return
+		ew.println(color.YellowString("Not found in VirusTotal"))
+		return ew.err
 	}
 
-	fmt.Fprintf(w, "%-16s%s\n", "Name:", vtResult.Name)
-	fmt.Fprintf(w, "%-16s%s\n", "Reputation:", repColorInt(vtResult.Reputation))
-	fmt.Fprintln(w)
+	ew.printf("%-16s%s\n", "Name:", vtResult.Name)
+	ew.printf("%-16s%s\n", "Reputation:", repColorInt(vtResult.Reputation))
+	ew.println()
 
-	fmt.Fprintf(w, "%-16s%s\n", "Malicious:", redOrGreenInt(vtResult.Malicious))
-	fmt.Fprintf(w, "%-16s%s\n", "Suspicious:", yellowOrGreenInt(vtResult.Suspicious))
-	fmt.Fprintf(w, "%-16s%s\n", "Undetected:", yellowOrGreenInt(vtResult.Undetected))
-	fmt.Fprintf(w, "%-16s%s\n", "Harmless:", color.GreenString("%d", vtResult.Harmless))
-	fmt.Fprintln(w)
+	ew.printf("%-16s%s\n", "Malicious:", redOrGreenInt(vtResult.Malicious))
+	ew.printf("%-16s%s\n", "Suspicious:", yellowOrGreenInt(vtResult.Suspicious))
+	ew.printf("%-16s%s\n", "Undetected:", yellowOrGreenInt(vtResult.Undetected))
+	ew.printf("%-16s%s\n", "Harmless:", color.GreenString("%d", vtResult.Harmless))
+	ew.println()
 
 	switch {
 	case vtResult.ThreatLabel == "":
-		fmt.Fprintf(w, "%-16s%s\n", "Threat:", "None")
+		ew.printf("%-16s%s\n", "Threat:", "None")
 	case vtResult.Malicious > 0:
-		fmt.Fprintf(w, "%-16s%s\n", "Threat:", color.RedString("%s", vtResult.ThreatLabel))
+		ew.printf("%-16s%s\n", "Threat:", color.RedString("%s", vtResult.ThreatLabel))
 	default:
-		fmt.Fprintf(w, "%-16s%s\n", "Threat:", vtResult.ThreatLabel)
+		ew.printf("%-16s%s\n", "Threat:", vtResult.ThreatLabel)
 	}
+
+	return ew.err
 }
 
 // printHashLine prints one hash line. The VT lookup hash is marked with *.
-func printHashLine(w io.Writer, label, hash string, isVTLookup bool) {
+func printHashLine(ew *errWriter, label, hash string, isVTLookup bool) {
 	prefix := "  "
 	if isVTLookup {
 		prefix = "* "
 	}
-	fmt.Fprintf(w, "%s%-14s%s\n", prefix, label+":", color.CyanString(hash))
+	ew.printf("%s%-14s%s\n", prefix, label+":", color.CyanString(hash))
 }
 
 func algoLabel(algo string) string {
