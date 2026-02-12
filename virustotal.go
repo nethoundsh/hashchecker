@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"strconv"
@@ -152,7 +152,7 @@ func waitForRateLimit(ctx context.Context, limiter *rate.Limiter) error {
 	// and can trigger server-side bot detection. The jitter makes
 	// inter-request gaps vary (e.g. 15.0–18.0s) while staying
 	// safely under the rate limit.
-	jitter := time.Duration(rand.Intn(3000)) * time.Millisecond
+	jitter := time.Duration(rand.N(3000)) * time.Millisecond
 	time.Sleep(jitter)
 	return nil
 }
