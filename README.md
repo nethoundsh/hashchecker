@@ -130,15 +130,22 @@ hashchecker /path/to/suspicious-file.exe
 ```
 
 ```
-Hash (SHA-256): e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+* SHA-256:      e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  SHA-1:        da39a3ee5e6b4b0d3255bfef95601890afd80709
+  MD5:          d41d8cd98f00b204e9800998ecf8427e
+
 Name:           suspicious-file.exe
 Reputation:     -47
+
 Malicious:      52
 Suspicious:     0
 Undetected:     12
 Harmless:       0
+
 Threat:         trojan.generic/agent
 ```
+
+The `*` marks the hash used for the VirusTotal lookup (SHA-256 by default). All three hashes are always computed in a single pass.
 
 ### Look up a known hash
 
@@ -232,15 +239,23 @@ hashchecker -free -rate 10 -r ~/Downloads  # uses 10 req/min
 hashchecker -o json /path/to/file
 ```
 
+Each result is a single NDJSON line containing all computed hashes, the lookup hash/algorithm, and the full VirusTotal result:
+
 ```json
-{"hash":"e3b0c44...","algorithm":"sha256","result":{"found":true,"name":"file.exe","reputation":-47,"malicious":52,"suspicious":0,"undetected":12,"harmless":0,"threat_label":"trojan.generic/agent"}}
+{"path":"/path/to/file","hashes":{"sha256":"e3b0c44...","sha1":"da39a3e...","md5":"d41d8cd..."},"lookup_hash":"e3b0c44...","lookup_algorithm":"sha256","result":{"found":true,"name":"file.exe","reputation":-47,"malicious":52,"suspicious":0,"undetected":12,"harmless":0,"threat_label":"trojan.generic/agent"}}
+```
+
+For raw hash lookups, only the matched algorithm appears in `hashes` and `path` is omitted:
+
+```json
+{"hashes":{"sha256":"e3b0c44..."},"lookup_hash":"e3b0c44...","lookup_algorithm":"sha256","result":{"found":true,"name":"file.exe","reputation":-47,"malicious":52,...}}
 ```
 
 For directory scans, each file produces one JSON line followed by a summary line:
 
 ```json
-{"path":"/path/to/file1","hash":"abc123...","algorithm":"sha256","result":{...}}
-{"path":"/path/to/file2","hash":"def456...","algorithm":"sha256","result":{...}}
+{"path":"/path/to/file1","hashes":{"sha256":"abc...","sha1":"def...","md5":"012..."},"lookup_hash":"abc...","lookup_algorithm":"sha256","result":{...}}
+{"path":"/path/to/file2","hashes":{"sha256":"fed...","sha1":"cba...","md5":"987..."},"lookup_hash":"fed...","lookup_algorithm":"sha256","result":{...}}
 {"summary":{"path":"/path/to/dir","scanned":2,"found":2,"malicious":1}}
 ```
 
