@@ -533,23 +533,7 @@ func startMockVT(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		_, _ = fmt.Fprint(w, `{
-			"data": {
-				"attributes": {
-					"meaningful_name": "test.exe",
-					"reputation": 0,
-					"last_analysis_stats": {
-						"malicious": 0,
-						"suspicious": 0,
-						"undetected": 5,
-						"harmless": 60
-					},
-					"popular_threat_classification": {
-						"suggested_threat_label": ""
-					}
-				}
-			}
-		}`)
+		_, _ = fmt.Fprint(w, vtJSON("test.exe", 0, 0, 0, 5, 60, ""))
 	}))
 	t.Setenv("VIRUSTOTAL_API_KEY", "test-key")
 	t.Setenv("VIRUSTOTAL_BASE_URL", srv.URL+"/")
@@ -575,23 +559,7 @@ func TestRunHashLookupMalicious(t *testing.T) {
 	// Mock server returns malicious > 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		_, _ = fmt.Fprint(w, `{
-			"data": {
-				"attributes": {
-					"meaningful_name": "evil.exe",
-					"reputation": -10,
-					"last_analysis_stats": {
-						"malicious": 42,
-						"suspicious": 3,
-						"undetected": 5,
-						"harmless": 10
-					},
-					"popular_threat_classification": {
-						"suggested_threat_label": "trojan.generic"
-					}
-				}
-			}
-		}`)
+		_, _ = fmt.Fprint(w, vtJSON("evil.exe", -10, 42, 3, 5, 10, "trojan.generic"))
 	}))
 	defer srv.Close()
 

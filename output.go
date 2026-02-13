@@ -59,12 +59,12 @@ func (ew *errWriter) println(a ...any) {
 
 // printLookupResult prints a single lookup result in the configured format.
 // hashes is non-nil for file input (shows all three) and nil for raw hash input.
-func printLookupResult(w io.Writer, path, hash string, cfg lookupConfig, result VirusTotalResult, hashes *hashResult) error {
-	switch cfg.output {
+func printLookupResult(w io.Writer, path, hash, output, algo string, result VirusTotalResult, hashes *hashResult) error {
+	switch output {
 	case "json":
-		return printJSON(w, path, hash, cfg.algo, result, hashes)
+		return printJSON(w, path, hash, algo, result, hashes)
 	default:
-		return printResult(w, hash, cfg.algo, result, hashes)
+		return printResult(w, hash, algo, result, hashes)
 	}
 }
 

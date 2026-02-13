@@ -27,18 +27,26 @@ type VirusTotalResult struct {
 	ThreatLabel string `json:"threat_label"` // suggested threat label, if any
 }
 
-type lookupConfig struct {
-	ctx          context.Context
-	client       *http.Client
-	apiKey       string
-	output       string
-	algo         string // hash algorithm: "sha256", "sha1", or "md5"
-	cache        map[string]cacheEntry
-	cacheMu      *sync.Mutex // protects cache; pointer so lookupConfig stays copyable
+type vtClient struct {
+	ctx     context.Context
+	client  *http.Client
+	apiKey  string
+	baseURL string // empty defaults to production
+	limiter *rate.Limiter
+}
+
+type cacheConfig struct {
+	entries      map[string]cacheEntry
+	mu           *sync.Mutex
 	refresh      bool
-	cacheAgeDays int
-	limiter      *rate.Limiter
-	baseURL      string // base URL for VT API; empty defaults to production
+	maxAgeDays   int
+}
+
+type lookupConfig struct {
+	vt    vtClient
+	cache cacheConfig
+	output string
+	algo   string // hash algorithm: "sha256", "sha1", or "md5"
 }
 
 // lookup checks the cache and calls the VirusTotal API if needed,
@@ -46,13 +54,13 @@ type lookupConfig struct {
 func lookup(hash string, cfg lookupConfig) (VirusTotalResult, error) {
 	// Cache key is "algo:hash" so results from different algorithms don't collide.
 	cacheKey := cfg.algo + ":" + hash
-	if !cfg.refresh {
-		cfg.cacheMu.Lock()
-		entry, ok := cfg.cache[cacheKey]
-		cfg.cacheMu.Unlock()
+	if !cfg.cache.refresh {
+		cfg.cache.mu.Lock()
+		entry, ok := cfg.cache.entries[cacheKey]
+		cfg.cache.mu.Unlock()
 		if ok {
 			age := time.Since(entry.Timestamp)
-			if age < time.Duration(cfg.cacheAgeDays)*24*time.Hour {
+			if age < time.Duration(cfg.cache.maxAgeDays)*24*time.Hour {
 				return entry.Result, nil
 			}
 		}
@@ -60,22 +68,22 @@ func lookup(hash string, cfg lookupConfig) (VirusTotalResult, error) {
 
 	// Rate limit is intentionally placed AFTER the cache check —
 	// cache hits don't consume rate limit tokens.
-	if err := waitForRateLimit(cfg.ctx, cfg.limiter); err != nil {
+	if err := waitForRateLimit(cfg.vt.ctx, cfg.vt.limiter); err != nil {
 		return VirusTotalResult{}, fmt.Errorf("rate limiter: %w", err)
 	}
 
-	result, err := checkVirusTotal(cfg.ctx, cfg.client, cfg.apiKey, hash, cfg.baseURL)
+	result, err := checkVirusTotal(cfg.vt.ctx, cfg.vt.client, cfg.vt.apiKey, hash, cfg.vt.baseURL)
 	if err != nil {
 		return VirusTotalResult{}, err
 	}
 
 	// Store fresh result; cache is flushed to disk by deferred flushCache() in run().
-	cfg.cacheMu.Lock()
-	cfg.cache[cacheKey] = cacheEntry{
+	cfg.cache.mu.Lock()
+	cfg.cache.entries[cacheKey] = cacheEntry{
 		Result:    result,
 		Timestamp: time.Now(),
 	}
-	cfg.cacheMu.Unlock()
+	cfg.cache.mu.Unlock()
 
 	return result, nil
 }

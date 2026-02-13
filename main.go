@@ -58,6 +58,12 @@ type hashResult struct {
 	MD5    string
 }
 
+type fileResult struct {
+	looked    bool // true if the file was successfully looked up
+	found     bool // true if VirusTotal had a report
+	malicious bool // true if any engine flagged as malicious
+}
+
 // ForAlgo returns the hash for the given algorithm name.
 func (h hashResult) ForAlgo(algo string) string {
 	switch algo {
@@ -235,13 +241,13 @@ func parseConfig() (appConfig, error) {
 	switch *output {
 	case "text", "json":
 	default:
-		return appConfig{}, fmt.Errorf("invalid -o value; must be 'text' or 'json'")
+		return appConfig{}, errors.New("invalid -o value; must be 'text' or 'json'")
 	}
 
 	switch *algo {
 	case "sha256", "sha1", "md5":
 	default:
-		return appConfig{}, fmt.Errorf("invalid -algo value; must be 'sha256', 'sha1', or 'md5'")
+		return appConfig{}, errors.New("invalid -algo value; must be 'sha256', 'sha1', or 'md5'")
 	}
 
 	if *output == "json" || *noColor {
@@ -300,7 +306,7 @@ func parseConfig() (appConfig, error) {
 
 	apiKey := strings.TrimSpace(os.Getenv("VIRUSTOTAL_API_KEY"))
 	if apiKey == "" {
-		return appConfig{}, fmt.Errorf("VIRUSTOTAL_API_KEY is not set")
+		return appConfig{}, errors.New("VIRUSTOTAL_API_KEY is not set")
 	}
 
 	arg := flag.Arg(0)
@@ -308,17 +314,21 @@ func parseConfig() (appConfig, error) {
 	succeeded = true
 	return appConfig{
 		lookupCfg: lookupConfig{
-			ctx:          ctx,
-			client:       client,
-			apiKey:       apiKey,
-			output:       *output,
-			algo:         *algo,
-			cache:        cache,
-			cacheMu:      &sync.Mutex{},
-			refresh:      *refresh,
-			cacheAgeDays: *cacheAge,
-			limiter:      limiter,
-			baseURL:      os.Getenv("VIRUSTOTAL_BASE_URL"),
+			vt: vtClient{
+				ctx:     ctx,
+				client:  client,
+				apiKey:  apiKey,
+				baseURL: os.Getenv("VIRUSTOTAL_BASE_URL"),
+				limiter: limiter,
+			},
+			cache: cacheConfig{
+				entries:    cache,
+				mu:         &sync.Mutex{},
+				refresh:    *refresh,
+				maxAgeDays: *cacheAge,
+			},
+			output: *output,
+			algo:   *algo,
 		},
 		scanCfg: scanConfig{
 			recursive:  *recursive,
@@ -346,7 +356,7 @@ func runHash(arg, detectedAlgo string, cfg lookupConfig) int {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
-	if err := printLookupResult(os.Stdout, "", hash, cfg, result, nil); err != nil {
+	if err := printLookupResult(os.Stdout, "", hash, cfg.output, cfg.algo, result, nil); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
@@ -356,57 +366,62 @@ func runHash(arg, detectedAlgo string, cfg lookupConfig) int {
 	return 0
 }
 
+func processFile(w io.Writer, path string, cfg lookupConfig, progress *mpb.Progress) (fileResult, error) {
+	hashes, err := hashFile(path)
+	if err != nil {
+		return fileResult{}, err
+	}
+	hash := hashes.ForAlgo(cfg.algo)
+
+	var outputWriter io.Writer = w
+	var buf bytes.Buffer
+	if progress != nil {
+		outputWriter = &buf
+	}
+
+	if cfg.output == "text" {
+		_, _ = fmt.Fprintln(outputWriter, color.HiBlueString("--- %s ---", path))
+	}
+
+	result, err := lookup(hash, cfg)
+	if err != nil {
+		return fileResult{}, err
+	}
+	if err := printLookupResult(outputWriter, path, hash, cfg.output, cfg.algo, result, &hashes); err != nil {
+		return fileResult{}, err
+	}
+
+	if progress != nil {
+		_, _ = progress.Write(buf.Bytes())
+	}
+
+	return fileResult{
+		looked:    true,
+		found:     result.Found,
+		malicious: result.Found && result.Malicious > 0,
+	}, nil
+}
+
+// handleProcessResult aggregates counters from a processFile result and increments progress bar.
+func handleProcessResult(path string, fr fileResult, processErr error, looked, found, malicious *int, bar *mpb.Bar) {
+	if processErr != nil {
+		fmt.Fprintln(os.Stderr, "Error:", path, processErr)
+	} else {
+		if fr.looked { *looked++ }
+		if fr.found  { *found++ }
+		if fr.malicious { *malicious++ }
+	}
+	if bar != nil {
+		bar.Increment()
+	}
+}
+
 // runDir walks a directory, hashes each matching file, and looks it up.
 // With showProgress, files are collected first to get a total for the bar.
 func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int {
 	var looked, found, malicious int
 	var progress *mpb.Progress
 	var bar *mpb.Bar
-
-	processFile := func(path string) {
-		hashes, err := hashFile(path)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", path, err)
-			return
-		}
-		hash := hashes.ForAlgo(cfg.algo)
-
-		var w io.Writer = os.Stdout
-		var buf bytes.Buffer
-		if progress != nil {
-			w = &buf
-		}
-
-		if cfg.output == "text" {
-			_, _ = fmt.Fprintln(w, color.HiBlueString("--- %s ---", path))
-		}
-
-		result, err := lookup(hash, cfg)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			return
-		}
-		if err := printLookupResult(w, path, hash, cfg, result, &hashes); err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			return
-		}
-
-		if progress != nil {
-			_, _ = progress.Write(buf.Bytes())
-		}
-
-		looked++
-		if result.Found {
-			found++
-			if result.Malicious > 0 {
-				malicious++
-			}
-		}
-
-		if bar != nil {
-			bar.Increment()
-		}
-	}
 
 	var err error
 
@@ -417,7 +432,7 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 		}
 
 		if len(files) > 0 {
-			progress = mpb.NewWithContext(cfg.ctx, mpb.WithOutput(os.Stderr))
+			progress = mpb.NewWithContext(cfg.vt.ctx, mpb.WithOutput(os.Stderr))
 			bar = progress.New(int64(len(files)),
 				mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding(" ").Rbound("]"),
 				mpb.PrependDecorators(decor.Name("Scanning ")),
@@ -430,18 +445,20 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 		}
 
 		for _, path := range files {
-			if cfg.ctx.Err() != nil {
-				err = cfg.ctx.Err()
+			if cfg.vt.ctx.Err() != nil {
+				err = cfg.vt.ctx.Err()
 				break
 			}
-			processFile(path)
+			fr, processErr := processFile(os.Stdout, path, cfg, progress)
+			handleProcessResult(path, fr, processErr, &looked, &found, &malicious, bar)
 		}
 	} else {
 		err = walkMatchingFiles(arg, sc, func(path string, _ fs.DirEntry) error {
-			if cfg.ctx.Err() != nil {
-				return cfg.ctx.Err()
+			if cfg.vt.ctx.Err() != nil {
+				return cfg.vt.ctx.Err()
 			}
-			processFile(path)
+			fr, processErr := processFile(os.Stdout, path, cfg, progress)
+			handleProcessResult(path, fr, processErr, &looked, &found, &malicious, bar)
 			return nil
 		})
 	}
@@ -451,7 +468,7 @@ func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int 
 	}
 
 	if err != nil {
-		if cfg.ctx.Err() != nil {
+		if cfg.vt.ctx.Err() != nil {
 			fmt.Fprintln(os.Stderr, "\nInterrupted")
 		} else {
 			fmt.Fprintln(os.Stderr, "Error:", err)
@@ -556,7 +573,7 @@ func runFile(arg string, fi os.FileInfo, cfg lookupConfig, sc scanConfig) int {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
-	if err := printLookupResult(os.Stdout, arg, hash, cfg, result, &hashes); err != nil {
+	if err := printLookupResult(os.Stdout, arg, hash, cfg.output, cfg.algo, result, &hashes); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}

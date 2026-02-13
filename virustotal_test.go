@@ -46,13 +46,12 @@ func TestCheckVirusTotal(t *testing.T) {
 	const testHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 	tests := []struct {
-		name        string
-		handler     http.HandlerFunc
-		wantFound   bool
-		wantMal     int
-		wantErr     string
-		cancelCtx   bool
-		serverDelay time.Duration
+		name      string
+		handler   http.HandlerFunc
+		wantFound bool
+		wantMal   int
+		wantErr   string
+		cancelCtx bool
 	}{
 		{
 			name: "200 success with malicious",
@@ -253,17 +252,21 @@ func TestLookup(t *testing.T) {
 			defer srv.Close()
 
 			cfg := lookupConfig{
-				ctx:          context.Background(),
-				client:       srv.Client(),
-				apiKey:       "test-key",
-				output:       "text",
-				algo:         "sha256",
-				cache:        tt.cache,
-				cacheMu:      &sync.Mutex{},
-				refresh:      tt.refresh,
-				cacheAgeDays: 7,
-				limiter:      nil,
-				baseURL:      srv.URL + "/",
+				vt: vtClient{
+					ctx:     context.Background(),
+					client:  srv.Client(),
+					apiKey:  "test-key",
+					baseURL: srv.URL + "/",
+					limiter: nil,
+				},
+				cache: cacheConfig{
+					entries:    tt.cache,
+					mu:         &sync.Mutex{},
+					refresh:    tt.refresh,
+					maxAgeDays: 7,
+				},
+				output: "text",
+				algo:   "sha256",
 			}
 
 			result, err := lookup(testHash, cfg)
