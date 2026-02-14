@@ -2,16 +2,21 @@
 // against the VirusTotal API to check for known malware. It supports
 // SHA-256 (default), SHA-1, and MD5 via the -algo flag.
 //
-// It supports three input modes:
+// It supports four input modes:
 //   - A raw hash string (64 hex chars for SHA-256, 40 for SHA-1, 32 for MD5)
 //   - A path to a single file
 //   - A path to a directory (scans all regular files, optionally recursive)
+//   - A hash-list file via -f (one hash per line; comments with # supported)
 //
 // Results can be printed as colored human-readable text or as NDJSON for
 // piping into other tools. A local disk cache avoids redundant API calls.
+// Directory and hash-list scans run concurrently using a worker pool
+// (configurable with -workers). Output order matches input order
+// regardless of worker count.
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/md5"
@@ -27,6 +32,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -64,6 +70,27 @@ type fileResult struct {
 	malicious bool // true if any engine flagged as malicious
 }
 
+// fileJob represents a file to be processed by a worker.
+type fileJob struct {
+	index int
+	path  string
+}
+
+// workerOutput holds rendered output for a single worker job.
+type workerOutput struct {
+	index  int
+	label  string
+	output []byte
+	result fileResult
+	err    error
+}
+
+type hashJob struct {
+	index int
+	hash  string
+	algo  string
+}
+
 // ForAlgo returns the hash for the given algorithm name.
 func (h hashResult) ForAlgo(algo string) string {
 	switch algo {
@@ -92,6 +119,8 @@ type appConfig struct {
 	lookupCfg    lookupConfig
 	scanCfg      scanConfig
 	arg          string
+	hashListPath string
+	workers      int
 	showProgress bool
 	flushCache   func()
 	stop         func()
@@ -124,6 +153,10 @@ func run() int {
 	defer cfg.stop()
 	defer cfg.flushCache()
 
+	if cfg.hashListPath != "" {
+		return runHashList(cfg.hashListPath, cfg.lookupCfg, cfg.workers)
+	}
+
 	if ok, detectedAlgo := isHexHash(cfg.arg); ok {
 		return runHash(cfg.arg, detectedAlgo, cfg.lookupCfg)
 	}
@@ -133,7 +166,7 @@ func run() int {
 		return 1
 	}
 	if fi.IsDir() {
-		return runDir(cfg.arg, cfg.lookupCfg, cfg.scanCfg, cfg.showProgress)
+		return runDir(cfg.arg, cfg.lookupCfg, cfg.scanCfg, cfg.showProgress, cfg.workers)
 	}
 	return runFile(cfg.arg, fi, cfg.lookupCfg, cfg.scanCfg)
 }
@@ -150,7 +183,9 @@ func parseConfig() (appConfig, error) {
 	refresh := flag.Bool("refresh", false, "ignore cached results but still write new ones")
 	cacheAge := flag.Int("cache-age", 7, "maximum age of cached results in days")
 	recursive := flag.Bool("r", false, "recursively scan subdirectories")
+	workers := flag.Int("workers", 0, "number of concurrent workers for directory and hash-list scans (0 = number of CPUs)")
 	algo := flag.String("algo", "sha256", "hash algorithm for VirusTotal lookup: sha256, sha1, or md5")
+	hashListFile := flag.String("f", "", "path to a file containing one hash per line")
 	showVersion := flag.Bool("version", false, "print version and exit")
 
 	include := flag.String("include", "", "comma-separated glob patterns — only process matching files (e.g. \"*.exe,*.dll\")")
@@ -159,7 +194,7 @@ func parseConfig() (appConfig, error) {
 	maxSizeStr := flag.String("max-size", "", "maximum file size with units (e.g. \"100MB\", \"1GB\")")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: hashchecker [flags] <file | hash | directory>\n\nFlags:\n")
+		fmt.Fprintf(os.Stderr, "Usage: hashchecker [flags] <file | hash | directory | -f hashlist>\n\nFlags:\n")
 		flag.PrintDefaults()
 	}
 
@@ -270,8 +305,19 @@ func parseConfig() (appConfig, error) {
 		fmt.Fprintf(os.Stderr, "Rate limiting: %d requests/min\n", effectiveRate)
 	}
 
-	if flag.NArg() < 1 {
+	if *hashListFile == "" && flag.NArg() < 1 {
 		return appConfig{}, errUsage
+	}
+	if *hashListFile != "" && flag.NArg() > 0 {
+		return appConfig{}, errors.New("-f cannot be combined with a positional argument")
+	}
+
+	w := *workers
+	if w < 0 {
+		return appConfig{}, errors.New("invalid -workers value; must be >= 0")
+	}
+	if w <= 0 {
+		w = runtime.NumCPU()
 	}
 
 	// Graceful degradation: warn and continue without caching on errors.
@@ -309,7 +355,10 @@ func parseConfig() (appConfig, error) {
 		return appConfig{}, errors.New("VIRUSTOTAL_API_KEY is not set")
 	}
 
-	arg := flag.Arg(0)
+	var arg string
+	if flag.NArg() > 0 {
+		arg = flag.Arg(0)
+	}
 
 	succeeded = true
 	return appConfig{
@@ -340,6 +389,8 @@ func parseConfig() (appConfig, error) {
 			maxSizeStr: *maxSizeStr,
 		},
 		arg:          arg,
+		hashListPath: *hashListFile,
+		workers:      w,
 		showProgress: showProgress,
 		flushCache:   flushCache,
 		stop:         stop,
@@ -366,99 +417,349 @@ func runHash(arg, detectedAlgo string, cfg lookupConfig) int {
 	return 0
 }
 
-func processFile(w io.Writer, path string, cfg lookupConfig, progress *mpb.Progress) (fileResult, error) {
+func processFileToOutput(path string, cfg lookupConfig) workerOutput {
+	var buf bytes.Buffer
+	if cfg.output == "text" {
+		_, _ = fmt.Fprintln(&buf, color.HiBlueString("--- %s ---", path))
+	}
+
 	hashes, err := hashFile(path)
 	if err != nil {
-		return fileResult{}, err
+		return workerOutput{label: path, output: buf.Bytes(), err: err}
 	}
 	hash := hashes.ForAlgo(cfg.algo)
 
-	var outputWriter io.Writer = w
-	var buf bytes.Buffer
-	if progress != nil {
-		outputWriter = &buf
-	}
-
-	if cfg.output == "text" {
-		_, _ = fmt.Fprintln(outputWriter, color.HiBlueString("--- %s ---", path))
-	}
-
 	result, err := lookup(hash, cfg)
 	if err != nil {
-		return fileResult{}, err
+		return workerOutput{label: path, output: buf.Bytes(), err: err}
 	}
-	if err := printLookupResult(outputWriter, path, hash, cfg.output, cfg.algo, result, &hashes); err != nil {
-		return fileResult{}, err
-	}
-
-	if progress != nil {
-		_, _ = progress.Write(buf.Bytes())
+	if err := printLookupResult(&buf, path, hash, cfg.output, cfg.algo, result, &hashes); err != nil {
+		return workerOutput{label: path, output: buf.Bytes(), err: err}
 	}
 
-	return fileResult{
-		looked:    true,
-		found:     result.Found,
-		malicious: result.Found && result.Malicious > 0,
-	}, nil
+	return workerOutput{
+		label:  path,
+		output: buf.Bytes(),
+		result: fileResult{
+			looked:    true,
+			found:     result.Found,
+			malicious: result.Found && result.Malicious > 0,
+		},
+	}
 }
 
-// handleProcessResult aggregates counters from a processFile result and increments progress bar.
-func handleProcessResult(path string, fr fileResult, processErr error, looked, found, malicious *int, bar *mpb.Bar) {
-	if processErr != nil {
-		fmt.Fprintln(os.Stderr, "Error:", path, processErr)
+func processHashToOutput(job hashJob, cfg lookupConfig) workerOutput {
+	var buf bytes.Buffer
+	cfg.algo = job.algo
+
+	result, err := lookup(job.hash, cfg)
+	if err != nil {
+		return workerOutput{index: job.index, label: job.hash, err: err}
+	}
+	if err := printLookupResult(&buf, "", job.hash, cfg.output, cfg.algo, result, nil); err != nil {
+		return workerOutput{index: job.index, label: job.hash, output: buf.Bytes(), err: err}
+	}
+
+	return workerOutput{
+		index:  job.index,
+		label:  job.hash,
+		output: buf.Bytes(),
+		result: fileResult{
+			looked:    true,
+			found:     result.Found,
+			malicious: result.Found && result.Malicious > 0,
+		},
+	}
+}
+
+func handleConcurrentFileResult(out workerOutput, looked, found, malicious *int, bar *mpb.Bar, progress *mpb.Progress) {
+	if len(out.output) > 0 {
+		if progress != nil {
+			_, _ = progress.Write(out.output)
+		} else {
+			_, _ = os.Stdout.Write(out.output)
+		}
+	}
+	if out.err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", out.label, out.err)
 	} else {
-		if fr.looked { *looked++ }
-		if fr.found  { *found++ }
-		if fr.malicious { *malicious++ }
+		if out.result.looked {
+			*looked++
+		}
+		if out.result.found {
+			*found++
+		}
+		if out.result.malicious {
+			*malicious++
+		}
 	}
 	if bar != nil {
 		bar.Increment()
 	}
 }
 
+func initProgressBar(ctx context.Context, total int64) (*mpb.Progress, *mpb.Bar) {
+	p := mpb.NewWithContext(ctx, mpb.WithOutput(os.Stderr))
+	b := p.New(total,
+		mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding(" ").Rbound("]"),
+		mpb.PrependDecorators(decor.Name("Scanning ")),
+		mpb.AppendDecorators(
+			decor.CountersNoUnit(" %d / %d "),
+			decor.AverageETA(decor.ET_STYLE_MMSS),
+		),
+		mpb.BarRemoveOnComplete(),
+	)
+	return p, b
+}
+
+// runHashList reads hashes from a file (one per line) and looks each up.
+// Blank lines and lines starting with # are skipped.
+func runHashList(path string, cfg lookupConfig, workers int) int {
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		return 1
+	}
+	defer func() { _ = f.Close() }()
+
+	var looked, found, malicious int
+	scanner := bufio.NewScanner(f)
+	var jobs []hashJob
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		ok, detectedAlgo := isHexHash(line)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "Warning: skipping invalid hash: %s\n", line)
+			continue
+		}
+		jobs = append(jobs, hashJob{
+			index: len(jobs),
+			hash:  strings.ToLower(line),
+			algo:  detectedAlgo,
+		})
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "Error reading hash list:", err)
+		return 1
+	}
+
+	if workers > 1 && len(jobs) > 1 {
+		jobCh := make(chan hashJob, workers)
+		results := make(chan workerOutput, workers)
+
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for job := range jobCh {
+					if cfg.vt.ctx.Err() != nil {
+						return
+					}
+					out := processHashToOutput(job, cfg)
+					select {
+					case results <- out:
+					case <-cfg.vt.ctx.Done():
+						return
+					}
+				}
+			}()
+		}
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			pending := make(map[int]workerOutput)
+			next := 0
+			for out := range results {
+				pending[out.index] = out
+				for {
+					current, ok := pending[next]
+					if !ok {
+						break
+					}
+					delete(pending, next)
+					handleConcurrentFileResult(current, &looked, &found, &malicious, nil, nil)
+					next++
+				}
+			}
+		}()
+
+		interrupted := false
+	sendJobs:
+		for _, job := range jobs {
+			select {
+			case jobCh <- job:
+			case <-cfg.vt.ctx.Done():
+				interrupted = true
+				break sendJobs
+			}
+		}
+		close(jobCh)
+		wg.Wait()
+		close(results)
+		<-done
+
+		if interrupted {
+			fmt.Fprintln(os.Stderr, "\nInterrupted")
+			return 1
+		}
+	} else {
+		for _, job := range jobs {
+			if cfg.vt.ctx.Err() != nil {
+				fmt.Fprintln(os.Stderr, "\nInterrupted")
+				return 1
+			}
+			out := processHashToOutput(job, cfg)
+			handleConcurrentFileResult(out, &looked, &found, &malicious, nil, nil)
+		}
+	}
+
+	if cfg.output == "json" {
+		if err := printJSONSummary(os.Stdout, path, looked, found, malicious); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			return 1
+		}
+	} else {
+		maliciousStr := color.GreenString("%d", malicious)
+		if malicious > 0 {
+			maliciousStr = color.RedString("%d", malicious)
+		}
+		hashWord := "hashes"
+		if looked == 1 {
+			hashWord = "hash"
+		}
+		_, _ = fmt.Fprintf(os.Stdout, "Checked %d %s, %d found in VirusTotal, %s malicious\n", looked, hashWord, found, maliciousStr)
+	}
+
+	if malicious > 0 {
+		return 2
+	}
+	return 0
+}
+
 // runDir walks a directory, hashes each matching file, and looks it up.
 // With showProgress, files are collected first to get a total for the bar.
-func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool) int {
+// Without showProgress, worker mode streams files lazily from WalkDir.
+func runDir(arg string, cfg lookupConfig, sc scanConfig, showProgress bool, workers int) int {
 	var looked, found, malicious int
 	var progress *mpb.Progress
 	var bar *mpb.Bar
 
 	var err error
+	if workers > 1 {
+		var files []string
+		if showProgress {
+			var collectErr error
+			files, collectErr = collectMatchingFiles(arg, sc)
+			if collectErr != nil {
+				fmt.Fprintln(os.Stderr, "Warning: could not collect files:", collectErr)
+			}
+			if len(files) > 0 {
+				progress, bar = initProgressBar(cfg.vt.ctx, int64(len(files)))
+			}
+		}
 
-	if showProgress {
+		jobs := make(chan fileJob, workers)
+		results := make(chan workerOutput, workers)
+
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for job := range jobs {
+					if cfg.vt.ctx.Err() != nil {
+						return
+					}
+					out := processFileToOutput(job.path, cfg)
+					out.index = job.index
+					select {
+					case results <- out:
+					case <-cfg.vt.ctx.Done():
+						return
+					}
+				}
+			}()
+		}
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			pending := make(map[int]workerOutput)
+			nextIndex := 0
+			for out := range results {
+				pending[out.index] = out
+				for {
+					current, ok := pending[nextIndex]
+					if !ok {
+						break
+					}
+					delete(pending, nextIndex)
+					handleConcurrentFileResult(current, &looked, &found, &malicious, bar, progress)
+					nextIndex++
+				}
+			}
+		}()
+
+		if showProgress {
+		sendCollectedJobs:
+			for i, path := range files {
+				select {
+				case jobs <- fileJob{index: i, path: path}:
+				case <-cfg.vt.ctx.Done():
+					err = cfg.vt.ctx.Err()
+					break sendCollectedJobs
+				}
+			}
+		} else {
+			nextIndex := 0
+			err = walkMatchingFiles(arg, sc, func(path string, _ fs.DirEntry) error {
+				if cfg.vt.ctx.Err() != nil {
+					return cfg.vt.ctx.Err()
+				}
+				select {
+				case jobs <- fileJob{index: nextIndex, path: path}:
+					nextIndex++
+					return nil
+				case <-cfg.vt.ctx.Done():
+					return cfg.vt.ctx.Err()
+				}
+			})
+		}
+
+		close(jobs)
+		wg.Wait()
+		close(results)
+		<-done
+	} else if showProgress {
 		files, collectErr := collectMatchingFiles(arg, sc)
 		if collectErr != nil {
 			fmt.Fprintln(os.Stderr, "Warning: could not collect files:", collectErr)
 		}
-
 		if len(files) > 0 {
-			progress = mpb.NewWithContext(cfg.vt.ctx, mpb.WithOutput(os.Stderr))
-			bar = progress.New(int64(len(files)),
-				mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding(" ").Rbound("]"),
-				mpb.PrependDecorators(decor.Name("Scanning ")),
-				mpb.AppendDecorators(
-					decor.CountersNoUnit(" %d / %d "),
-					decor.AverageETA(decor.ET_STYLE_MMSS),
-				),
-				mpb.BarRemoveOnComplete(),
-			)
+			progress, bar = initProgressBar(cfg.vt.ctx, int64(len(files)))
 		}
-
 		for _, path := range files {
 			if cfg.vt.ctx.Err() != nil {
 				err = cfg.vt.ctx.Err()
 				break
 			}
-			fr, processErr := processFile(os.Stdout, path, cfg, progress)
-			handleProcessResult(path, fr, processErr, &looked, &found, &malicious, bar)
+			out := processFileToOutput(path, cfg)
+			handleConcurrentFileResult(out, &looked, &found, &malicious, bar, progress)
 		}
 	} else {
 		err = walkMatchingFiles(arg, sc, func(path string, _ fs.DirEntry) error {
 			if cfg.vt.ctx.Err() != nil {
 				return cfg.vt.ctx.Err()
 			}
-			fr, processErr := processFile(os.Stdout, path, cfg, progress)
-			handleProcessResult(path, fr, processErr, &looked, &found, &malicious, bar)
+			out := processFileToOutput(path, cfg)
+			handleConcurrentFileResult(out, &looked, &found, &malicious, nil, nil)
 			return nil
 		})
 	}

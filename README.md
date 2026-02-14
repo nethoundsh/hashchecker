@@ -100,7 +100,7 @@ To persist, add this to your PowerShell profile (`$PROFILE`).
 ## Usage
 
 ```
-hashchecker [flags] <file | hash | directory>
+hashchecker [flags] <file | hash | directory | -f hashlist>
 ```
 
 ### Flags
@@ -122,6 +122,8 @@ hashchecker [flags] <file | hash | directory>
 | `-min-size SIZE` | Minimum file size with units (e.g. `"1KB"`, `"10MB"`) |
 | `-max-size SIZE` | Maximum file size with units (e.g. `"100MB"`, `"1GB"`) |
 | `-version` | Print version and exit |
+| `-f PATH` | Read hashes from a file (one hash per line) and look up each one |
+| `-workers N` | Number of concurrent workers for directory and hash-list scans (default: CPU count) |
 
 ### Scan a single file
 
@@ -151,6 +153,29 @@ The `*` marks the hash used for the VirusTotal lookup (SHA-256 by default). All 
 
 ```bash
 hashchecker 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
+```
+
+### Bulk Hash Checking
+
+Check a list of IOCs from a file (one hash per line):
+
+```bash
+hashchecker -f iocs.txt -free
+```
+
+The file supports comments (`#`) and mixed hash types (SHA-256, SHA-1, MD5):
+
+```text
+# Emotet samples - 2024-01
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+da39a3ee5e6b4b0d3255bfef95601890afd80709
+d41d8cd98f00b204e9800998ecf8427e
+```
+
+Filter JSON output for malicious hits:
+
+```bash
+hashchecker -f iocs.txt -o json | jq 'select(.result.malicious > 0)'
 ```
 
 ### Use a different hash algorithm
@@ -232,6 +257,19 @@ hashchecker -rate 10 -r ~/Downloads
 # -rate overrides -free if both are set
 hashchecker -free -rate 10 -r ~/Downloads  # uses 10 req/min
 ```
+
+### Concurrent Scanning
+
+Directory and hash-list scans use a worker pool to process entries in parallel. By default, worker count matches your CPU count.
+
+```bash
+hashchecker -r -workers 8 /path/to/directory
+hashchecker -f iocs.txt -workers 8
+```
+
+Output order remains deterministic (input order), regardless of worker count.
+
+The rate limiter still applies globally. For example, `-free -workers 8` still allows at most 4 API requests per minute. Cache hits bypass the rate limiter, so concurrency helps most when many lookups are already cached.
 
 ### JSON output
 

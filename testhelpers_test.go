@@ -41,3 +41,29 @@ func captureStdout(t *testing.T, fn func()) string {
 	os.Stdout = old
 	return string(out)
 }
+
+// captureStderr redirects os.Stderr to a pipe, runs fn, and returns
+// everything fn wrote to stderr as a string.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe(): %v", err)
+	}
+
+	os.Stderr = w
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatalf("closing stderr pipe: %v", err)
+	}
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("reading captured stderr: %v", err)
+	}
+
+	os.Stderr = old
+	return string(out)
+}
