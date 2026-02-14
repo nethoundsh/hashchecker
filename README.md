@@ -7,7 +7,9 @@ A command-line tool that computes file hashes and checks them against the [Virus
 - **Multi-hash support** — SHA-256 (default), SHA-1, and MD5 via the `-algo` flag. Files are streamed through `hash.Hash` so even large files are hashed without loading them entirely into memory.
 - **VirusTotal lookup** — queries the VirusTotal v3 API and reports malicious/suspicious/undetected/harmless engine counts, reputation score, and threat classification. The API natively accepts SHA-256, SHA-1, and MD5 hashes.
 - **Direct hash lookup** — pass a hex hash string instead of a file path to look up a hash you already have (64 chars for SHA-256, 40 for SHA-1, 32 for MD5).
+- **Bulk hash-list input** — use `-f hashes.txt` to check a list of IOCs (one hash per line). Supports `#` comments and mixed hash types (SHA-256, SHA-1, MD5) in the same file — each hash's algorithm is auto-detected from its length.
 - **Directory scanning** — point it at a directory to scan all regular files (symlinks are skipped). Use `-r` for recursive scanning with automatic skipping of common non-essential directories (`.git`, `node_modules`, `__pycache__`, `vendor`, etc.). A bottom-anchored progress bar shows file count and ETA while per-file results scroll above it.
+- **Concurrent processing** — directory and hash-list scans use a bounded worker pool (default: one worker per CPU). Workers hash files and query VirusTotal in parallel while output order remains deterministic. The rate limiter is shared across all workers, so API pacing is always respected.
 - **Progress bar** — directory scans display a bottom-anchored progress bar on stderr with file count and ETA. Per-file results scroll above the bar so it always stays at the bottom of the terminal. Automatically suppressed in JSON mode, when stderr is not a TTY (piped/redirected), or when `-no-progress` is passed.
 - **File filtering** — narrow which files get scanned with glob patterns (`-include`, `-exclude`) and size limits (`-min-size`, `-max-size`). Filters are applied before hashing, so excluded files don't waste CPU or API quota.
 - **Rate limiting** — the `-free` flag enforces VirusTotal's free-tier limit (4 requests/minute), or use `-rate N` for custom pacing. Uses a token-bucket limiter with random jitter to avoid bot detection.
@@ -26,7 +28,7 @@ A command-line tool that computes file hashes and checks them against the [Virus
 
 - **Supply Chain Verification** — Before deploying third-party binaries, scripts, or vendor-provided software into production, verify that no component is flagged by any of VirusTotal's detection engines. Integrate into your deployment pipeline with JSON output and scriptable exit codes (exit 2 = malicious detected).
 
-- **Threat Hunting** — Proactively scan file servers, shared drives, or developer workstations for known indicators of compromise (IOCs). Use file filtering to focus on high-risk file types (executables, DLLs, scripts) and size ranges that match known threat profiles.
+- **Threat Hunting** — Proactively scan file servers, shared drives, or developer workstations for known indicators of compromise (IOCs). Use file filtering to focus on high-risk file types (executables, DLLs, scripts) and size ranges that match known threat profiles. Bulk-check IOC hash lists from threat intelligence feeds with `-f iocs.txt`.
 
 - **Compliance & Audit** — Generate machine-readable JSON reports of file integrity checks across critical systems. The NDJSON output integrates directly with SIEM platforms, log aggregators, and compliance reporting tools.
 
@@ -386,12 +388,12 @@ Error: writing cache: write /tmp/results.json.tmp: no space left on device
 
 ```
 hashchecker/
-  main.go                          Entry point, parseConfig(), run() dispatch, helpers (runHash, runDir, runFile), hashing
+  main.go                          Entry point, parseConfig(), run() dispatch, worker pool, helpers (runHash, runDir, runFile, runHashList), hashing
   virustotal.go                    VirusTotal API client, lookup(), result types, rate limiting, retry logic
   output.go                        Text and JSON output formatting, printLookupResult(), color helpers
   cache.go                         Disk cache: load, save (atomic), expiry
   filter.go                        File filtering by glob pattern and size
-  main_test.go                     Tests for run(), hashing, filters, retry parsing
+  main_test.go                     Tests for run(), hashing, filters, hash-list input, concurrency, retry parsing
   virustotal_test.go               httptest integration tests for API client, caching, rate limiting
   output_test.go                   Output formatting and color helper tests
   cache_test.go                    Filesystem tests for cache load/save/round-trip
@@ -427,7 +429,7 @@ Workflows are defined in [`.github/workflows/`](.github/workflows/). The Go vers
 go test ./...
 ```
 
-The test suite has **123 tests** (including subtests) across 4 test files with **~85% statement coverage**.
+The test suite has **123 tests** (including subtests) across 4 test files with **~83% statement coverage**.
 
 **`main_test.go`** — Core logic and end-to-end `run()` tests:
 - **`TestIsHexHash`** — hash detection for all algorithms (SHA-256 valid/invalid, SHA-1 valid/cross-rejection, MD5 valid/cross-rejection, unsupported algorithm)
@@ -435,7 +437,11 @@ The test suite has **123 tests** (including subtests) across 4 test files with *
 - **`TestTruncateRunes`** — string truncation with multi-byte character safety
 - **`TestParseRetryAfter`** — Retry-After header parsing (integers, zero, negative, garbage, RFC 1123 dates)
 - **`TestShouldProcess`** — file filter logic (include/exclude globs, size bounds, combined filters)
-- **`TestRun*`** — end-to-end tests for `run()`: flag validation (version, no args, missing API key, invalid output/patterns/sizes/algo), hash lookups (clean, malicious, MD5), single file scanning (default SHA-256, SHA-1, size filters), directory scanning (flat, recursive, JSON, include/exclude)
+- **`TestRun*`** — end-to-end tests for `run()`: flag validation (version, no args, missing API key, invalid output/patterns/sizes/algo/workers), hash lookups (clean, malicious, MD5), single file scanning (default SHA-256, SHA-1, size filters), directory scanning (flat, recursive, JSON, include/exclude)
+- **`TestRunHashListMode`** — hash-list file input (`-f`): happy path with multiple hashes, malicious exit code 2, mixed algorithm auto-detection (SHA-256/SHA-1/MD5 in one file), comment and blank line skipping, invalid hash warnings, empty file handling, mutual exclusivity with positional args, missing file error
+- **`TestRunDirectoryConcurrent*`** — concurrent worker pool: basic multi-worker scan, deterministic output ordering with 10 files and 4 workers, malicious exit code propagation, workers=1 matches workers=4 output
+- **`TestRunHashListConcurrent`** — concurrent hash-list processing with 3 workers
+- **`TestRunConcurrentInterrupt`** — graceful shutdown under pre-cancelled context with worker pool
 
 **`virustotal_test.go`** — httptest-based integration tests:
 - **`TestCheckVirusTotal`** — HTTP client against a mock server (200 success, clean file, 404 not found, 429 retry, 429 exhausted, 403 bad key, bad JSON, context cancellation)
