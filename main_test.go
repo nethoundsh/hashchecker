@@ -120,6 +120,9 @@ func TestHashFile(t *testing.T) {
 		if want := hex.EncodeToString(sumMD5[:]); got.MD5 != want {
 			t.Fatalf("MD5 = %q, want %q", got.MD5, want)
 		}
+		if got.TLSH != "" {
+			t.Fatalf("TLSH = %q, want empty for small file", got.TLSH)
+		}
 	})
 
 	t.Run("empty file", func(t *testing.T) {
@@ -135,6 +138,27 @@ func TestHashFile(t *testing.T) {
 		if want := hex.EncodeToString(sum256[:]); got.SHA256 != want {
 			t.Fatalf("SHA256 = %q, want %q", got.SHA256, want)
 		}
+		if got.TLSH != "" {
+			t.Fatalf("TLSH = %q, want empty for empty file", got.TLSH)
+		}
+	})
+
+	t.Run("large file includes tlsh", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "large")
+		data := make([]byte, 1024)
+		for i := range data {
+			data[i] = byte(i % 251)
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatalf("writing temp file: %v", err)
+		}
+		got, err := hashFile(path)
+		if err != nil {
+			t.Fatalf("hashFile() error: %v", err)
+		}
+		if got.TLSH == "" {
+			t.Fatal("TLSH should be non-empty for large varied file")
+		}
 	})
 
 	t.Run("nonexistent file", func(t *testing.T) {
@@ -143,6 +167,40 @@ func TestHashFile(t *testing.T) {
 			t.Fatal("hashFile() should return error for nonexistent file")
 		}
 	})
+}
+
+func TestNewFileMeta(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "meta.txt")
+	if err := os.WriteFile(path, []byte("metadata test content"), 0o640); err != nil {
+		t.Fatalf("writing temp file: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat temp file: %v", err)
+	}
+
+	meta := newFileMeta(path, fi)
+	if meta == nil {
+		t.Fatal("newFileMeta returned nil")
+	}
+	if meta.Name != fi.Name() {
+		t.Fatalf("Name = %q, want %q", meta.Name, fi.Name())
+	}
+	if meta.Size != fi.Size() {
+		t.Fatalf("Size = %d, want %d", meta.Size, fi.Size())
+	}
+	if meta.SizeHuman == "" {
+		t.Fatal("SizeHuman should not be empty")
+	}
+	if meta.Modified.IsZero() {
+		t.Fatal("Modified should not be zero")
+	}
+	if meta.Permissions != fi.Mode().String() {
+		t.Fatalf("Permissions = %q, want %q", meta.Permissions, fi.Mode().String())
+	}
+	if !meta.Created.IsZero() && meta.Created.Location() != time.UTC {
+		t.Fatalf("Created should be UTC when present, got %v", meta.Created.Location())
+	}
 }
 
 func TestTruncateRunes(t *testing.T) {

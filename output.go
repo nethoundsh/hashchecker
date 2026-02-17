@@ -14,10 +14,12 @@ type jsonHashes struct {
 	SHA256 string `json:"sha256,omitempty"`
 	SHA1   string `json:"sha1,omitempty"`
 	MD5    string `json:"md5,omitempty"`
+	TLSH   string `json:"tlsh,omitempty"`
 }
 
 type jsonRecord struct {
 	Path       string           `json:"path,omitempty"`
+	File       *jsonFileMeta    `json:"file,omitempty"`
 	Hashes     jsonHashes       `json:"hashes"`
 	LookupHash string           `json:"lookup_hash"`
 	LookupAlgo string           `json:"lookup_algorithm"`
@@ -59,20 +61,21 @@ func (ew *errWriter) println(a ...any) {
 
 // printLookupResult prints a single lookup result in the configured format.
 // hashes is non-nil for file input (shows all three) and nil for raw hash input.
-func printLookupResult(w io.Writer, path, hash, output, algo string, result VirusTotalResult, hashes *hashResult) error {
+func printLookupResult(w io.Writer, path, hash, output, algo string, result VirusTotalResult, hashes *hashResult, meta *fileMeta) error {
 	switch output {
 	case "json":
-		return printJSON(w, path, hash, algo, result, hashes)
+		return printJSON(w, path, hash, algo, result, hashes, meta)
 	default:
-		return printResult(w, hash, algo, result, hashes)
+		return printResult(w, hash, algo, result, hashes, meta)
 	}
 }
 
 // printJSON emits a single NDJSON line for one file result.
 // hashes is non-nil for file input, nil for raw hash input.
-func printJSON(w io.Writer, path, hash, algo string, vtResult VirusTotalResult, hashes *hashResult) error {
+func printJSON(w io.Writer, path, hash, algo string, vtResult VirusTotalResult, hashes *hashResult, meta *fileMeta) error {
 	rec := jsonRecord{
 		Path:       path,
+		File:       toJSONFileMeta(meta),
 		LookupHash: hash,
 		LookupAlgo: algo,
 		Result:     vtResult,
@@ -82,6 +85,7 @@ func printJSON(w io.Writer, path, hash, algo string, vtResult VirusTotalResult, 
 			SHA256: hashes.SHA256,
 			SHA1:   hashes.SHA1,
 			MD5:    hashes.MD5,
+			TLSH:   hashes.TLSH,
 		}
 	} else {
 		switch algo {
@@ -121,13 +125,28 @@ func printJSONSummary(w io.Writer, path string, scanned, found, malicious int) e
 // printResult renders a color-coded summary. When hashes is non-nil (file
 // input), all three hash lines are shown with a * marking the VT lookup hash.
 // When nil (raw hash input), a single hash line is printed.
-func printResult(w io.Writer, hash, algo string, vtResult VirusTotalResult, hashes *hashResult) error {
+func printResult(w io.Writer, hash, algo string, vtResult VirusTotalResult, hashes *hashResult, meta *fileMeta) error {
 	ew := &errWriter{w: w}
+
+	if meta != nil {
+		const tsFormat = "2006-01-02 15:04:05 MST"
+		ew.printf("%-16s%s\n", "  File:", meta.Name)
+		ew.printf("%-16s%s\n", "  Size:", meta.SizeHuman)
+		ew.printf("%-16s%s\n", "  Modified:", meta.Modified.Format(tsFormat))
+		if !meta.Created.IsZero() {
+			ew.printf("%-16s%s\n", "  Created:", meta.Created.Format(tsFormat))
+		}
+		ew.printf("%-16s%s\n", "  Permissions:", meta.Permissions)
+		ew.println()
+	}
 
 	if hashes != nil {
 		printHashLine(ew, "SHA-256", hashes.SHA256, algo == "sha256")
 		printHashLine(ew, "SHA-1", hashes.SHA1, algo == "sha1")
 		printHashLine(ew, "MD5", hashes.MD5, algo == "md5")
+		if hashes.TLSH != "" {
+			printHashLine(ew, "TLSH", hashes.TLSH, false)
+		}
 	} else {
 		label := "Hash (" + algoLabel(algo) + "):"
 		ew.printf("%-16s%s\n", label, color.CyanString(hash))

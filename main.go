@@ -39,6 +39,7 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/fatih/color"
+	"github.com/glaslos/tlsh"
 	"github.com/mattn/go-isatty"
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
@@ -57,11 +58,12 @@ var skipDirs = map[string]bool{
 	"vendor": true, ".venv": true, ".idea": true, ".vscode": true,
 }
 
-// hashResult holds all three hash digests computed from a single file read.
+// hashResult holds all hash digests computed from a single file read.
 type hashResult struct {
 	SHA256 string
 	SHA1   string
 	MD5    string
+	TLSH   string
 }
 
 type fileResult struct {
@@ -407,7 +409,7 @@ func runHash(arg, detectedAlgo string, cfg lookupConfig) int {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
-	if err := printLookupResult(os.Stdout, "", hash, cfg.output, cfg.algo, result, nil); err != nil {
+	if err := printLookupResult(os.Stdout, "", hash, cfg.output, cfg.algo, result, nil, nil); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
@@ -422,6 +424,11 @@ func processFileToOutput(path string, cfg lookupConfig) workerOutput {
 	if cfg.output == "text" {
 		_, _ = fmt.Fprintln(&buf, color.HiBlueString("--- %s ---", path))
 	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return workerOutput{label: path, output: buf.Bytes(), err: err}
+	}
+	meta := newFileMeta(path, fi)
 
 	hashes, err := hashFile(path)
 	if err != nil {
@@ -433,7 +440,7 @@ func processFileToOutput(path string, cfg lookupConfig) workerOutput {
 	if err != nil {
 		return workerOutput{label: path, output: buf.Bytes(), err: err}
 	}
-	if err := printLookupResult(&buf, path, hash, cfg.output, cfg.algo, result, &hashes); err != nil {
+	if err := printLookupResult(&buf, path, hash, cfg.output, cfg.algo, result, &hashes, meta); err != nil {
 		return workerOutput{label: path, output: buf.Bytes(), err: err}
 	}
 
@@ -456,7 +463,7 @@ func processHashToOutput(job hashJob, cfg lookupConfig) workerOutput {
 	if err != nil {
 		return workerOutput{index: job.index, label: job.hash, err: err}
 	}
-	if err := printLookupResult(&buf, "", job.hash, cfg.output, cfg.algo, result, nil); err != nil {
+	if err := printLookupResult(&buf, "", job.hash, cfg.output, cfg.algo, result, nil, nil); err != nil {
 		return workerOutput{index: job.index, label: job.hash, output: buf.Bytes(), err: err}
 	}
 
@@ -874,7 +881,7 @@ func runFile(arg string, fi os.FileInfo, cfg lookupConfig, sc scanConfig) int {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
-	if err := printLookupResult(os.Stdout, arg, hash, cfg.output, cfg.algo, result, &hashes); err != nil {
+	if err := printLookupResult(os.Stdout, arg, hash, cfg.output, cfg.algo, result, &hashes, newFileMeta(arg, fi)); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		return 1
 	}
@@ -904,9 +911,9 @@ func isHexHash(s string) (bool, string) {
 	}
 }
 
-// hashFile computes SHA-256, SHA-1, and MD5 of filePath in a single pass
-// using io.MultiWriter. Disk I/O dominates, so computing all three costs
-// essentially the same as one.
+// hashFile computes SHA-256, SHA-1, MD5, and TLSH of filePath in a single pass.
+// Disk I/O dominates, so computing all four costs essentially the same as one.
+// TLSH requires >=256 bytes of diverse content; smaller/uniform files get TLSH="".
 func hashFile(filePath string) (_ hashResult, err error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -921,13 +928,62 @@ func hashFile(filePath string) (_ hashResult, err error) {
 	h256 := sha256.New()
 	h1 := sha1.New()
 	hMD5 := md5.New()
-
-	if _, err = io.Copy(io.MultiWriter(h256, h1, hMD5), file); err != nil {
-		return hashResult{}, fmt.Errorf("hashing %s: %w", filePath, err)
+	hTLSH := tlsh.New()
+	var totalBytes int64
+	tlshEnabled := true
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := file.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			totalBytes += int64(n)
+			if _, err := h256.Write(chunk); err != nil {
+				return hashResult{}, fmt.Errorf("hashing %s: %w", filePath, err)
+			}
+			if _, err := h1.Write(chunk); err != nil {
+				return hashResult{}, fmt.Errorf("hashing %s: %w", filePath, err)
+			}
+			if _, err := hMD5.Write(chunk); err != nil {
+				return hashResult{}, fmt.Errorf("hashing %s: %w", filePath, err)
+			}
+			if tlshEnabled {
+				wrote, tlshErr := hTLSH.Write(chunk)
+				if tlshErr != nil {
+					// TLSH can fail on some input; keep cryptographic hashes regardless.
+					tlshEnabled = false
+				}
+				_ = wrote // TLSH may report partial writes; best-effort collection is fine.
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return hashResult{}, fmt.Errorf("hashing %s: %w", filePath, readErr)
+		}
 	}
+
+	// TLSH is only valid for sufficiently large, diverse content.
+	var tlshValue string
+	if tlshEnabled && totalBytes >= 256 {
+		_ = hTLSH.Sum(nil)
+		tlshValue = func() (value string) {
+			defer func() {
+				if recover() != nil {
+					value = ""
+				}
+			}()
+			return hTLSH.String()
+		}()
+		if strings.Trim(tlshValue, "0") == "" {
+			tlshValue = ""
+		}
+	}
+
 	return hashResult{
 		SHA256: hex.EncodeToString(h256.Sum(nil)),
 		SHA1:   hex.EncodeToString(h1.Sum(nil)),
 		MD5:    hex.EncodeToString(hMD5.Sum(nil)),
+		TLSH:   tlshValue,
 	}, nil
 }

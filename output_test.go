@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fatih/color"
 )
@@ -18,9 +19,18 @@ func TestPrintJSON(t *testing.T) {
 			SHA256: "abc123sha256",
 			SHA1:   "abc123sha1",
 			MD5:    "abc123md5",
+			TLSH:   "T1AFAF4D4E6518A5B09F34A3400B0F84E82F4D9EF2C46A951441048B50C9DAA44D0A8A1",
 		}
 		var buf bytes.Buffer
-		if err := printJSON(&buf, "/tmp/test.exe", "abc123sha256", "sha256", vt, hashes); err != nil {
+		meta := &fileMeta{
+			Name:        "test.exe",
+			Size:        145408,
+			SizeHuman:   "145 kB",
+			Modified:    time.Date(2026, 1, 15, 9, 23, 41, 0, time.UTC),
+			Created:     time.Date(2026, 1, 10, 14, 5, 12, 0, time.UTC),
+			Permissions: "-rwxr-xr-x",
+		}
+		if err := printJSON(&buf, "/tmp/test.exe", "abc123sha256", "sha256", vt, hashes, meta); err != nil {
 			t.Fatalf("printJSON error: %v", err)
 		}
 		stdout := buf.String()
@@ -47,15 +57,24 @@ func TestPrintJSON(t *testing.T) {
 		if rec.Hashes.MD5 != "abc123md5" {
 			t.Fatalf("Hashes.MD5 = %q, want %q", rec.Hashes.MD5, "abc123md5")
 		}
+		if rec.Hashes.TLSH != "T1AFAF4D4E6518A5B09F34A3400B0F84E82F4D9EF2C46A951441048B50C9DAA44D0A8A1" {
+			t.Fatalf("Hashes.TLSH = %q, want TLSH value", rec.Hashes.TLSH)
+		}
 		if rec.Result.Malicious != 5 {
 			t.Fatalf("Result.Malicious = %d, want 5", rec.Result.Malicious)
+		}
+		if rec.File == nil || rec.File.Name != "test.exe" {
+			t.Fatalf("File metadata missing or wrong: %+v", rec.File)
+		}
+		if rec.File.Created == "" {
+			t.Fatalf("expected created timestamp, got %+v", rec.File)
 		}
 	})
 
 	t.Run("raw hash input (nil hashes)", func(t *testing.T) {
 		vt := VirusTotalResult{Found: true, Name: "raw.bin"}
 		var buf bytes.Buffer
-		if err := printJSON(&buf, "", "def456", "md5", vt, nil); err != nil {
+		if err := printJSON(&buf, "", "def456", "md5", vt, nil, nil); err != nil {
 			t.Fatalf("printJSON error: %v", err)
 		}
 		stdout := buf.String()
@@ -73,6 +92,30 @@ func TestPrintJSON(t *testing.T) {
 		}
 		if rec.Hashes.MD5 != "def456" {
 			t.Fatalf("Hashes.MD5 = %q, want %q", rec.Hashes.MD5, "def456")
+		}
+		if rec.File != nil {
+			t.Fatalf("raw hash lookup should omit file metadata, got %+v", rec.File)
+		}
+	})
+
+	t.Run("file metadata omits created when unknown", func(t *testing.T) {
+		vt := VirusTotalResult{Found: true, Name: "unknown.bin"}
+		hashes := &hashResult{SHA256: "abc123sha256"}
+		meta := &fileMeta{
+			Name:        "unknown.bin",
+			Size:        12,
+			SizeHuman:   "12 B",
+			Modified:    time.Date(2026, 1, 15, 9, 23, 41, 0, time.UTC),
+			Permissions: "-rw-r--r--",
+		}
+
+		var buf bytes.Buffer
+		if err := printJSON(&buf, "/tmp/unknown.bin", "abc123sha256", "sha256", vt, hashes, meta); err != nil {
+			t.Fatalf("printJSON error: %v", err)
+		}
+		stdout := strings.TrimSpace(buf.String())
+		if strings.Contains(stdout, `"created"`) {
+			t.Fatalf("expected created field omitted when zero, got: %s", stdout)
 		}
 	})
 }
@@ -118,15 +161,25 @@ func TestPrintResult(t *testing.T) {
 			SHA256: "abc123sha256",
 			SHA1:   "abc123sha1",
 			MD5:    "abc123md5",
+			TLSH:   "T1AFAF4D4E6518A5B09F34A3400B0F84E82F4D9EF2C46A951441048B50C9DAA44D0A8A1",
 		}
 		var buf bytes.Buffer
-		if err := printResult(&buf, "abc123sha256", "sha256", vt, hashes); err != nil {
+		meta := &fileMeta{
+			Name:        "malware.exe",
+			Size:        145408,
+			SizeHuman:   "145 kB",
+			Modified:    time.Date(2026, 1, 15, 9, 23, 41, 0, time.UTC),
+			Created:     time.Date(2026, 1, 10, 14, 5, 12, 0, time.UTC),
+			Permissions: "-rwxr-xr-x",
+		}
+		if err := printResult(&buf, "abc123sha256", "sha256", vt, hashes, meta); err != nil {
 			t.Fatalf("printResult error: %v", err)
 		}
 		stdout := buf.String()
 		for _, want := range []string{
 			"abc123sha256", "abc123sha1", "abc123md5",
-			"SHA-256", "SHA-1", "MD5",
+			"SHA-256", "SHA-1", "MD5", "TLSH",
+			"File:", "Size:", "Modified:", "Created:", "Permissions:",
 			"malware.exe", "-5", "42", "trojan.generic",
 			"*",
 		} {
@@ -136,10 +189,31 @@ func TestPrintResult(t *testing.T) {
 		}
 	})
 
+	t.Run("file input omits empty tlsh", func(t *testing.T) {
+		vt := VirusTotalResult{
+			Found: true, Name: "clean.exe", Reputation: 0,
+			Malicious: 0, Suspicious: 0, Undetected: 12, Harmless: 50,
+		}
+		hashes := &hashResult{
+			SHA256: "abc123sha256",
+			SHA1:   "abc123sha1",
+			MD5:    "abc123md5",
+			TLSH:   "",
+		}
+		var buf bytes.Buffer
+		if err := printResult(&buf, "abc123sha256", "sha256", vt, hashes, nil); err != nil {
+			t.Fatalf("printResult error: %v", err)
+		}
+		stdout := buf.String()
+		if strings.Contains(stdout, "TLSH") {
+			t.Fatalf("expected TLSH line to be omitted when empty, got: %s", stdout)
+		}
+	})
+
 	t.Run("raw hash input (nil hashes)", func(t *testing.T) {
 		vt := VirusTotalResult{Found: false}
 		var buf bytes.Buffer
-		if err := printResult(&buf, "def456", "sha1", vt, nil); err != nil {
+		if err := printResult(&buf, "def456", "sha1", vt, nil, nil); err != nil {
 			t.Fatalf("printResult error: %v", err)
 		}
 		stdout := buf.String()

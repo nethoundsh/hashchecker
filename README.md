@@ -1,10 +1,11 @@
 # hashchecker
 
-A command-line tool that computes file hashes and checks them against the [VirusTotal](https://www.virustotal.com/) API. Supports SHA-256 (default), SHA-1, and MD5. Scan a single file, look up a known hash, or sweep an entire directory — with colored terminal output, file filtering, and machine-readable JSON.
+A command-line tool that computes file hashes and checks them against the [VirusTotal](https://www.virustotal.com/) API. Computes SHA-256, SHA-1, MD5, and [TLSH](https://tlsh.org/) (locality-sensitive fuzzy hash) in a single pass. Scan a single file, look up a known hash, or sweep an entire directory — with colored terminal output, file filtering, and machine-readable JSON.
 
 ## Features
 
-- **Multi-hash support** — SHA-256 (default), SHA-1, and MD5 via the `-algo` flag. Files are streamed through `hash.Hash` so even large files are hashed without loading them entirely into memory.
+- **Multi-hash support** — SHA-256 (default), SHA-1, MD5, and TLSH computed in a single pass. The `-algo` flag selects which cryptographic hash is sent to VirusTotal. Files are streamed so even large files are hashed without loading them entirely into memory.
+- **TLSH (fuzzy hashing)** — every file scan also computes a [TLSH](https://tlsh.org/) locality-sensitive hash. Unlike cryptographic hashes, similar files produce similar TLSH values, making it useful for malware family clustering and similarity analysis. TLSH requires at least 256 bytes of diverse content; smaller or uniform files omit the TLSH line. TLSH is informational only and is not sent to VirusTotal.
 - **VirusTotal lookup** — queries the VirusTotal v3 API and reports malicious/suspicious/undetected/harmless engine counts, reputation score, and threat classification. The API natively accepts SHA-256, SHA-1, and MD5 hashes.
 - **Direct hash lookup** — pass a hex hash string instead of a file path to look up a hash you already have (64 chars for SHA-256, 40 for SHA-1, 32 for MD5).
 - **Bulk hash-list input** — use `-f hashes.txt` to check a list of IOCs (one hash per line). Supports `#` comments and mixed hash types (SHA-256, SHA-1, MD5) in the same file — each hash's algorithm is auto-detected from its length.
@@ -18,6 +19,7 @@ A command-line tool that computes file hashes and checks them against the [Virus
 - **Result caching** — caches VirusTotal results locally (`~/.cache/hashchecker/results.json`) to avoid redundant API calls. Cached results expire after 7 days by default. Control with `-no-cache`, `-refresh`, and `-cache-age`. Cache writes are atomic (write to temp file, then rename) to prevent corruption.
 - **Graceful cancellation** — press Ctrl+C to cleanly interrupt long-running scans. In-flight rate-limit waits, HTTP requests, and directory walks exit immediately, and the cache is flushed before shutdown.
 - **Contextual error messages** — every error is wrapped with `fmt.Errorf("context: %w", err)` so messages tell you *what operation* failed and *which file or hash* was involved (e.g. `"hashing /tmp/foo: permission denied"` instead of a bare `"permission denied"`). Error chains are preserved via `%w`, so `errors.Is` and `errors.As` still work for programmatic error inspection.
+- **File metadata** — every file scan displays metadata (name, size, modified/created timestamps, permissions) before the hash lines. Created time uses platform-native APIs (`statx` on Linux, `Birthtime` on macOS/Windows) and is omitted when unavailable. Metadata is included in both text and JSON output.
 - **Scriptable exit codes** — exit 0 for clean, 1 for errors, 2 when malicious files are detected.
 
 ## Use Cases
@@ -134,9 +136,16 @@ hashchecker /path/to/suspicious-file.exe
 ```
 
 ```
+  File:         suspicious-file.exe
+  Size:         145 kB
+  Modified:     2026-01-15 09:23:41 UTC
+  Created:      2026-01-10 14:05:12 UTC
+  Permissions:  -rwxr-xr-x
+
 * SHA-256:      e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
   SHA-1:        da39a3ee5e6b4b0d3255bfef95601890afd80709
   MD5:          d41d8cd98f00b204e9800998ecf8427e
+  TLSH:         T1A12F0E8546A28B5E9734F0400B1F84E82F5D9EF3C47A951441048B50D9DAA44D0B8A1
 
 Name:           suspicious-file.exe
 Reputation:     -47
@@ -149,7 +158,7 @@ Harmless:       0
 Threat:         trojan.generic/agent
 ```
 
-The `*` marks the hash used for the VirusTotal lookup (SHA-256 by default). All three hashes are always computed in a single pass.
+The `*` marks the hash used for the VirusTotal lookup (SHA-256 by default). All four hashes are computed in a single pass. The TLSH line is omitted for files smaller than 256 bytes.
 
 ### Look up a known hash
 
@@ -282,8 +291,10 @@ hashchecker -o json /path/to/file
 Each result is a single NDJSON line containing all computed hashes, the lookup hash/algorithm, and the full VirusTotal result:
 
 ```json
-{"path":"/path/to/file","hashes":{"sha256":"e3b0c44...","sha1":"da39a3e...","md5":"d41d8cd..."},"lookup_hash":"e3b0c44...","lookup_algorithm":"sha256","result":{"found":true,"name":"file.exe","reputation":-47,"malicious":52,"suspicious":0,"undetected":12,"harmless":0,"threat_label":"trojan.generic/agent"}}
+{"path":"/path/to/file","file":{"name":"file.exe","size":145408,"size_human":"145 kB","modified":"2026-01-15T09:23:41Z","created":"2026-01-10T14:05:12Z","permissions":"-rwxr-xr-x"},"hashes":{"sha256":"e3b0c44...","sha1":"da39a3e...","md5":"d41d8cd...","tlsh":"T1A12F0..."},"lookup_hash":"e3b0c44...","lookup_algorithm":"sha256","result":{"found":true,"name":"file.exe","reputation":-47,"malicious":52,"suspicious":0,"undetected":12,"harmless":0,"threat_label":"trojan.generic/agent"}}
 ```
+
+The `file` object contains name, size (bytes and human-readable), timestamps, and permissions. The `created` field is omitted when the platform cannot determine birth time. The `tlsh` field is omitted when the file is too small (<256 bytes) or has insufficient byte diversity.
 
 For raw hash lookups, only the matched algorithm appears in `hashes` and `path` is omitted:
 
@@ -294,8 +305,8 @@ For raw hash lookups, only the matched algorithm appears in `hashes` and `path` 
 For directory scans, each file produces one JSON line followed by a summary line:
 
 ```json
-{"path":"/path/to/file1","hashes":{"sha256":"abc...","sha1":"def...","md5":"012..."},"lookup_hash":"abc...","lookup_algorithm":"sha256","result":{...}}
-{"path":"/path/to/file2","hashes":{"sha256":"fed...","sha1":"cba...","md5":"987..."},"lookup_hash":"fed...","lookup_algorithm":"sha256","result":{...}}
+{"path":"/path/to/file1","file":{"name":"file1","size":2048,"size_human":"2.0 kB","modified":"2026-01-15T09:23:41Z","permissions":"-rw-r--r--"},"hashes":{"sha256":"abc...","sha1":"def...","md5":"012...","tlsh":"T1A12..."},"lookup_hash":"abc...","lookup_algorithm":"sha256","result":{...}}
+{"path":"/path/to/file2","file":{"name":"file2","size":8192,"size_human":"8.2 kB","modified":"2026-02-01T12:00:00Z","permissions":"-rwxr-xr-x"},"hashes":{"sha256":"fed...","sha1":"cba...","md5":"987...","tlsh":"T1B34..."},"lookup_hash":"fed...","lookup_algorithm":"sha256","result":{...}}
 {"summary":{"path":"/path/to/dir","scanned":2,"found":2,"malicious":1}}
 ```
 
@@ -391,11 +402,16 @@ hashchecker/
   main.go                          Entry point, parseConfig(), run() dispatch, worker pool, helpers (runHash, runDir, runFile, runHashList), hashing
   virustotal.go                    VirusTotal API client, lookup(), result types, rate limiting, retry logic
   output.go                        Text and JSON output formatting, printLookupResult(), color helpers
+  filestats.go                     File metadata: fileMeta struct, newFileMeta(), JSON serialization
+  birthtime_linux.go               Linux birth time via statx() (build-tagged)
+  birthtime_darwin.go              macOS birth time via Birthtime (build-tagged)
+  birthtime_windows.go             Windows birth time via CreationTime (build-tagged)
+  birthtime_other.go               Fallback (zero time) for unsupported platforms
   cache.go                         Disk cache: load, save (atomic), expiry
   filter.go                        File filtering by glob pattern and size
-  main_test.go                     Tests for run(), hashing, filters, hash-list input, concurrency, retry parsing
+  main_test.go                     Tests for run(), hashing, filters, hash-list input, concurrency, retry parsing, file metadata
   virustotal_test.go               httptest integration tests for API client, caching, rate limiting
-  output_test.go                   Output formatting and color helper tests
+  output_test.go                   Output formatting, file metadata rendering, and color helper tests
   cache_test.go                    Filesystem tests for cache load/save/round-trip
   testhelpers_test.go              Shared test utilities (stdout capture)
   go.mod                           Module definition and dependencies
@@ -429,11 +445,12 @@ Workflows are defined in [`.github/workflows/`](.github/workflows/). The Go vers
 go test ./...
 ```
 
-The test suite has **123 tests** (including subtests) across 4 test files with **~83% statement coverage**.
+The test suite has **127 tests** (including subtests) across 4 test files with **~84% statement coverage**.
 
 **`main_test.go`** — Core logic and end-to-end `run()` tests:
 - **`TestIsHexHash`** — hash detection for all algorithms (SHA-256 valid/invalid, SHA-1 valid/cross-rejection, MD5 valid/cross-rejection, unsupported algorithm)
 - **`TestHashFile`** — file hashing across algorithms (SHA-256, SHA-1, MD5 known content, unsupported algo error, nonexistent file error)
+- **`TestNewFileMeta`** — file metadata extraction (name, size, human-readable size, modified/created timestamps in UTC, permissions)
 - **`TestTruncateRunes`** — string truncation with multi-byte character safety
 - **`TestParseRetryAfter`** — Retry-After header parsing (integers, zero, negative, garbage, RFC 1123 dates)
 - **`TestShouldProcess`** — file filter logic (include/exclude globs, size bounds, combined filters)
@@ -450,8 +467,8 @@ The test suite has **123 tests** (including subtests) across 4 test files with *
 - **`TestWaitForRateLimit`** — rate limiter (nil limiter, fast limiter, cancelled context)
 
 **`output_test.go`** — Output formatting:
-- **`TestPrintJSON`** / **`TestPrintJSONSummary`** — JSON output structure and `omitempty` behavior
-- **`TestPrintResult`** — human-readable output (found with details, not found message)
+- **`TestPrintJSON`** / **`TestPrintJSONSummary`** — JSON output structure, `omitempty` behavior, file metadata presence and created-time omission when zero
+- **`TestPrintResult`** — human-readable output (found with details, file metadata labels, not found message)
 - **`TestColorHelpers`** — ANSI color selection for reputation, malicious, and suspicious counts
 
 **`cache_test.go`** — Filesystem operations:
@@ -483,7 +500,9 @@ go test -cover ./...
 | [`github.com/fatih/color`](https://github.com/fatih/color) | ANSI-colored terminal output |
 | [`github.com/mattn/go-isatty`](https://github.com/mattn/go-isatty) | Detect whether a file descriptor is a terminal (TTY) |
 | [`github.com/vbauerster/mpb/v8`](https://github.com/vbauerster/mpb) | Bottom-anchored terminal progress bar with ETA display |
+| [`golang.org/x/sys`](https://pkg.go.dev/golang.org/x/sys) | Platform-native syscalls for file birth time (`statx` on Linux) |
 | [`golang.org/x/time/rate`](https://pkg.go.dev/golang.org/x/time/rate) | Token-bucket rate limiter for API call pacing |
+| [`github.com/glaslos/tlsh`](https://github.com/glaslos/tlsh) | TLSH locality-sensitive fuzzy hashing |
 
 ## License
 
