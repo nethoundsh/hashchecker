@@ -8,7 +8,7 @@ A command-line tool that computes file hashes and checks them against the [Virus
 - **TLSH (fuzzy hashing)** — every file scan also computes a [TLSH](https://tlsh.org/) locality-sensitive hash. Unlike cryptographic hashes, similar files produce similar TLSH values, making it useful for malware family clustering and similarity analysis. TLSH requires at least 256 bytes of diverse content; smaller or uniform files omit the TLSH line. TLSH is informational only and is not sent to VirusTotal.
 - **VirusTotal lookup** — queries the VirusTotal v3 API and reports malicious/suspicious/undetected/harmless engine counts, reputation score, and threat classification. The API natively accepts SHA-256, SHA-1, and MD5 hashes.
 - **Direct hash lookup** — pass a hex hash string instead of a file path to look up a hash you already have (64 chars for SHA-256, 40 for SHA-1, 32 for MD5).
-- **Bulk hash-list input** — use `-f hashes.txt` to check a list of IOCs (one hash per line). Supports `#` comments and mixed hash types (SHA-256, SHA-1, MD5) in the same file — each hash's algorithm is auto-detected from its length.
+- **Bulk hash-list input** — use `-f hashes.txt` to check a list of IOCs (one hash per line). Supports `#` comments and mixed hash types (SHA-256, SHA-1, MD5) in the same file — each hash's algorithm is auto-detected from its length. The `-algo` flag is ignored in this mode since each hash is identified individually.
 - **Directory scanning** — point it at a directory to scan all regular files (symlinks are skipped). Use `-r` for recursive scanning with automatic skipping of common non-essential directories (`.git`, `node_modules`, `__pycache__`, `vendor`, etc.). A bottom-anchored progress bar shows file count and ETA while per-file results scroll above it.
 - **Concurrent processing** — directory and hash-list scans use a bounded worker pool (default: one worker per CPU). Workers hash files and query VirusTotal in parallel while output order remains deterministic. The rate limiter is shared across all workers, so API pacing is always respected.
 - **Progress bar** — directory scans display a bottom-anchored progress bar on stderr with file count and ETA. Per-file results scroll above the bar so it always stays at the bottom of the terminal. Automatically suppressed in JSON mode, when stderr is not a TTY (piped/redirected), or when `-no-progress` is passed.
@@ -165,6 +165,8 @@ The `*` marks the hash used for the VirusTotal lookup (SHA-256 by default). All 
 ```bash
 hashchecker 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
 ```
+
+> **Note:** If the argument is a valid hex hash (64, 40, or 32 hex characters), hashchecker treats it as a hash lookup, even if a file with that name exists on disk. To force a file scan on a hash-named file, use a path prefix: `./275a021b...` or an absolute path.
 
 ### Bulk Hash Checking
 
@@ -357,7 +359,9 @@ Results are cached locally to reduce API calls. The cache file is stored at:
 
 Cache writes are atomic — data is written to a temporary file first, then renamed into place. This prevents a crash mid-write from corrupting your cache.
 
-By default, cached results are valid for 7 days. To force a fresh lookup:
+By default, cached results are valid for 7 days. "Not found" results (VirusTotal 404) are also cached — if you upload a file to VirusTotal and want to re-check it before the cache expires, use `-refresh`.
+
+To force a fresh lookup:
 
 ```bash
 hashchecker -refresh /path/to/file
@@ -399,27 +403,48 @@ Error: writing cache: write /tmp/results.json.tmp: no space left on device
 
 ```
 hashchecker/
-  main.go                          Entry point, parseConfig(), run() dispatch, worker pool, helpers (runHash, runDir, runFile, runHashList), hashing
-  virustotal.go                    VirusTotal API client, lookup(), result types, rate limiting, retry logic
-  output.go                        Text and JSON output formatting, printLookupResult(), color helpers
-  filestats.go                     File metadata: fileMeta struct, newFileMeta(), JSON serialization
-  birthtime_linux.go               Linux birth time via statx() (build-tagged)
-  birthtime_darwin.go              macOS birth time via Birthtime (build-tagged)
-  birthtime_windows.go             Windows birth time via CreationTime (build-tagged)
-  birthtime_other.go               Fallback (zero time) for unsupported platforms
-  cache.go                         Disk cache: load, save (atomic), expiry
-  filter.go                        File filtering by glob pattern and size
-  main_test.go                     Tests for run(), hashing, filters, hash-list input, concurrency, retry parsing, file metadata
-  virustotal_test.go               httptest integration tests for API client, caching, rate limiting
-  output_test.go                   Output formatting, file metadata rendering, and color helper tests
-  cache_test.go                    Filesystem tests for cache load/save/round-trip
-  testhelpers_test.go              Shared test utilities (stdout capture)
-  go.mod                           Module definition and dependencies
-  .golangci.yml                    Linter configuration (golangci-lint v2)
-  .goreleaser.yml                  Cross-platform release build configuration
-  .github/workflows/ci.yml        GitHub Actions CI: golangci-lint + tests on push/PR
-  .github/workflows/release.yml   Automated releases: builds binaries + checksums on tag push
-  LICENSE                          MIT license
+  main.go                                     Entry point, flag parsing, resource initialization, run() dispatch
+  main_test.go                                End-to-end tests for run() and flag validation
+  testhelpers_test.go                         Shared test utilities (stdout/stderr capture, VT JSON builder)
+
+  internal/runner/
+    runner.go                                 Application logic: OrderedPool, RunFile, RunDir, RunHash, RunHashList
+    runner_test.go                            Unit tests for OrderedPool (ordering, cancellation, edge cases)
+
+  pkg/hasher/
+    hasher.go                                 Multi-hash computation (SHA-256, SHA-1, MD5, TLSH) in a single pass
+    hasher_test.go                            Hash algorithm tests and hex validation
+
+  pkg/vtclient/
+    vtclient.go                               VirusTotal API client, Lookup with caching, rate limiting, retry logic
+    vtclient_test.go                          httptest integration tests for API client, caching, rate limiting
+
+  pkg/output/
+    output.go                                 Text and JSON (NDJSON) output formatting, color helpers
+    output_test.go                            Output formatting and JSON structure tests
+
+  pkg/cache/
+    cache.go                                  Generic disk cache: Load, Save (atomic write via temp+rename)
+    cache_test.go                             Cache load/save/round-trip and file path tests
+
+  pkg/filter/
+    filter.go                                 File filtering by glob pattern and size, directory walking
+    filter_test.go                            Filter logic tests (include/exclude, size bounds)
+
+  pkg/fileinfo/
+    fileinfo.go                               File metadata extraction (name, size, timestamps, permissions)
+    fileinfo_test.go                          Metadata extraction tests
+    birthtime_linux.go                        Linux birth time via statx() syscall (build-tagged)
+    birthtime_darwin.go                       macOS birth time via Birthtimespec (build-tagged)
+    birthtime_windows.go                      Windows birth time via CreationTime (build-tagged)
+    birthtime_other.go                        Fallback (zero time) for unsupported platforms
+
+  go.mod                                      Module definition and dependencies
+  .golangci.yml                               Linter configuration (golangci-lint v2)
+  .goreleaser.yml                             Cross-platform release build configuration
+  .github/workflows/ci.yml                   GitHub Actions CI: golangci-lint + tests on push/PR
+  .github/workflows/release.yml              Automated releases: builds binaries + checksums on tag push
+  LICENSE                                     MIT license
 ```
 
 ## CI / CD
@@ -445,37 +470,50 @@ Workflows are defined in [`.github/workflows/`](.github/workflows/). The Go vers
 go test ./...
 ```
 
-The test suite has **127 tests** (including subtests) across 4 test files with **~84% statement coverage**.
+The test suite has **126 tests** (including subtests) across 8 test files.
 
-**`main_test.go`** — Core logic and end-to-end `run()` tests:
-- **`TestIsHexHash`** — hash detection for all algorithms (SHA-256 valid/invalid, SHA-1 valid/cross-rejection, MD5 valid/cross-rejection, unsupported algorithm)
-- **`TestHashFile`** — file hashing across algorithms (SHA-256, SHA-1, MD5 known content, unsupported algo error, nonexistent file error)
-- **`TestNewFileMeta`** — file metadata extraction (name, size, human-readable size, modified/created timestamps in UTC, permissions)
-- **`TestTruncateRunes`** — string truncation with multi-byte character safety
-- **`TestParseRetryAfter`** — Retry-After header parsing (integers, zero, negative, garbage, RFC 1123 dates)
-- **`TestShouldProcess`** — file filter logic (include/exclude globs, size bounds, combined filters)
-- **`TestRun*`** — end-to-end tests for `run()`: flag validation (version, no args, missing API key, invalid output/patterns/sizes/algo/workers), hash lookups (clean, malicious, MD5), single file scanning (default SHA-256, SHA-1, size filters), directory scanning (flat, recursive, JSON, include/exclude)
+**`main_test.go`** — End-to-end `run()` tests:
+- **`TestRun*`** — flag validation (version, no args, missing API key, invalid output/patterns/sizes/algo/workers), hash lookups (clean, malicious, MD5), single file scanning (default SHA-256, SHA-1, size filters), directory scanning (flat, recursive, JSON, include/exclude)
 - **`TestRunHashListMode`** — hash-list file input (`-f`): happy path with multiple hashes, malicious exit code 2, mixed algorithm auto-detection (SHA-256/SHA-1/MD5 in one file), comment and blank line skipping, invalid hash warnings, empty file handling, mutual exclusivity with positional args, missing file error
-- **`TestRunDirectoryConcurrent*`** — concurrent worker pool: basic multi-worker scan, deterministic output ordering with 10 files and 4 workers, malicious exit code propagation, workers=1 matches workers=4 output
+- **`TestRunDirectoryConcurrent*`** — concurrent processing: basic multi-worker scan, deterministic output ordering with 10 files and 4 workers, malicious exit code propagation, workers=1 matches workers=4 output
 - **`TestRunHashListConcurrent`** — concurrent hash-list processing with 3 workers
-- **`TestRunConcurrentInterrupt`** — graceful shutdown under pre-cancelled context with worker pool
+- **`TestRunConcurrentInterrupt`** — graceful shutdown under pre-cancelled context
 
-**`virustotal_test.go`** — httptest-based integration tests:
+**`internal/runner/runner_test.go`** — OrderedPool unit tests:
+- **`TestOrderedPoolOrdering`** — verifies FIFO output ordering despite staggered worker completion
+- **`TestOrderedPoolSingleWorker`** / **`TestOrderedPoolSingleJob`** — exercises sequential fast-path
+- **`TestOrderedPoolEmptyJobs`** — empty input handling
+- **`TestOrderedPoolPreCancelledContext`** / **`TestOrderedPoolCancelMidFlight`** — context cancellation
+- **`TestOrderedPoolMoreWorkersThanJobs`** — workers > jobs edge case
+
+**`pkg/hasher/hasher_test.go`** — Hash computation:
+- **`TestIsHexHash`** — hash detection for all algorithms (SHA-256/SHA-1/MD5 valid, invalid, cross-rejection)
+- **`TestFile`** — multi-hash file computation (known content, empty file, large file with TLSH, nonexistent file)
+
+**`pkg/vtclient/vtclient_test.go`** — httptest-based integration tests:
 - **`TestCheckVirusTotal`** — HTTP client against a mock server (200 success, clean file, 404 not found, 429 retry, 429 exhausted, 403 bad key, bad JSON, context cancellation)
 - **`TestCheckVirusTotalSendsAPIKey`** — verifies API key header is sent
 - **`TestLookup`** — cache + API integration (cache miss, cache hit, expired cache, refresh bypass)
 - **`TestWaitForRateLimit`** — rate limiter (nil limiter, fast limiter, cancelled context)
+- **`TestTruncateRunes`** — string truncation with multi-byte character safety
+- **`TestParseRetryAfter`** — Retry-After header parsing (integers, zero, negative, garbage, RFC 1123 dates)
+- **`TestMigrateLegacyCacheKeys`** — verifies bare-hash keys are migrated to `algo:hash` format
 
-**`output_test.go`** — Output formatting:
-- **`TestPrintJSON`** / **`TestPrintJSONSummary`** — JSON output structure, `omitempty` behavior, file metadata presence and created-time omission when zero
-- **`TestPrintResult`** — human-readable output (found with details, file metadata labels, not found message)
+**`pkg/output/output_test.go`** — Output formatting:
+- **`TestPrintJSON`** / **`TestPrintJSONSummary`** — JSON output structure, `omitempty` behavior, file metadata presence
+- **`TestPrintResult`** — human-readable output (file metadata, hash lines, VT result details, threat label)
 - **`TestColorHelpers`** — ANSI color selection for reputation, malicious, and suspicious counts
 
-**`cache_test.go`** — Filesystem operations:
-- **`TestLoadCache`** — missing file, valid file, corrupt JSON graceful degradation
-- **`TestLoadCacheMigratesLegacyKeys`** — verifies bare-hash keys are migrated to `sha256:hash` format
-- **`TestSaveCache`** — file permissions (0600), JSON validity, save-then-load round-trip
-- **`TestGetCacheFilePath`** — path suffix verification
+**`pkg/cache/cache_test.go`** — Filesystem operations:
+- **`TestLoad`** — missing file returns empty map, valid file round-trip, corrupt JSON error
+- **`TestSave`** — file permissions (0600), JSON validity, save-then-load round-trip
+- **`TestFilePath`** — path suffix verification
+
+**`pkg/filter/filter_test.go`** — File filtering:
+- **`TestShouldProcess`** — table-driven tests for include/exclude globs, size bounds, combined filters
+
+**`pkg/fileinfo/fileinfo_test.go`** — File metadata:
+- **`TestNew`** — metadata extraction (name, size, human-readable size, timestamps in UTC, permissions)
 
 Check coverage:
 
