@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"testing"
@@ -28,7 +29,13 @@ func captureStdout(t *testing.T, fn func()) string {
 	}
 
 	os.Stdout = w
-	fn()
+	defer func() { os.Stdout = old }()
+
+	var panicVal any
+	func() {
+		defer func() { panicVal = recover() }()
+		fn()
+	}()
 	if err := w.Close(); err != nil {
 		t.Fatalf("closing stdout pipe: %v", err)
 	}
@@ -37,8 +44,9 @@ func captureStdout(t *testing.T, fn func()) string {
 	if err != nil {
 		t.Fatalf("reading captured stdout: %v", err)
 	}
-
-	os.Stdout = old
+	if panicVal != nil {
+		panic(panicVal)
+	}
 	return string(out)
 }
 
@@ -54,7 +62,13 @@ func captureStderr(t *testing.T, fn func()) string {
 	}
 
 	os.Stderr = w
-	fn()
+	defer func() { os.Stderr = old }()
+
+	var panicVal any
+	func() {
+		defer func() { panicVal = recover() }()
+		fn()
+	}()
 	if err := w.Close(); err != nil {
 		t.Fatalf("closing stderr pipe: %v", err)
 	}
@@ -63,7 +77,30 @@ func captureStderr(t *testing.T, fn func()) string {
 	if err != nil {
 		t.Fatalf("reading captured stderr: %v", err)
 	}
-
-	os.Stderr = old
+	if panicVal != nil {
+		panic(panicVal)
+	}
 	return string(out)
+}
+
+// vtJSON returns a valid VirusTotal API v3 JSON response body with
+// the given analysis stats.
+func vtJSON(name string, reputation, malicious, suspicious, undetected, harmless int, threatLabel string) string {
+	return fmt.Sprintf(`{
+		"data": {
+			"attributes": {
+				"meaningful_name": %q,
+				"reputation": %d,
+				"last_analysis_stats": {
+					"malicious": %d,
+					"suspicious": %d,
+					"undetected": %d,
+					"harmless": %d
+				},
+				"popular_threat_classification": {
+					"suggested_threat_label": %q
+				}
+			}
+		}
+	}`, name, reputation, malicious, suspicious, undetected, harmless, threatLabel)
 }

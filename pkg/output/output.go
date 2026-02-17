@@ -1,4 +1,4 @@
-package main
+package output
 
 import (
 	"encoding/json"
@@ -6,42 +6,39 @@ import (
 	"io"
 
 	"github.com/fatih/color"
+	"github.com/nethoundsh/hashchecker/pkg/fileinfo"
+	"github.com/nethoundsh/hashchecker/pkg/hasher"
+	"github.com/nethoundsh/hashchecker/pkg/vtclient"
 )
 
 // NDJSON output: each line is a self-contained JSON object.
-
-type jsonHashes struct {
+type JSONHashes struct {
 	SHA256 string `json:"sha256,omitempty"`
 	SHA1   string `json:"sha1,omitempty"`
 	MD5    string `json:"md5,omitempty"`
 	TLSH   string `json:"tlsh,omitempty"`
 }
 
-type jsonRecord struct {
-	Path       string           `json:"path,omitempty"`
-	File       *jsonFileMeta    `json:"file,omitempty"`
-	Hashes     jsonHashes       `json:"hashes"`
-	LookupHash string           `json:"lookup_hash"`
-	LookupAlgo string           `json:"lookup_algorithm"`
-	Result     VirusTotalResult `json:"result"`
+type JSONRecord struct {
+	Path       string             `json:"path,omitempty"`
+	File       *fileinfo.JSONMeta `json:"file,omitempty"`
+	Hashes     JSONHashes         `json:"hashes"`
+	LookupHash string             `json:"lookup_hash"`
+	LookupAlgo string             `json:"lookup_algorithm"`
+	Result     vtclient.Result    `json:"result"`
 }
 
-type jsonSummary struct {
-	Path      string `json:"path"`      // the directory that was scanned
-	Scanned   int    `json:"scanned"`   // total files looked up
-	Found     int    `json:"found"`     // how many VT had a report for
-	Malicious int    `json:"malicious"` // how many of those were flagged as malicious
+type JSONSummary struct {
+	Path      string `json:"path"`
+	Scanned   int    `json:"scanned"`
+	Found     int    `json:"found"`
+	Malicious int    `json:"malicious"`
 }
 
-// jsonSummaryRecord wraps jsonSummary so consumers can distinguish
-// summary lines from per-file result lines via the "summary" key.
-type jsonSummaryRecord struct {
-	Summary jsonSummary `json:"summary"`
+type JSONSummaryRecord struct {
+	Summary JSONSummary `json:"summary"`
 }
 
-// errWriter captures the first write error, allowing a sequence of
-// fmt calls without checking each one individually. This is the same
-// pattern used by bufio.Writer and the standard library's encoders.
 type errWriter struct {
 	w   io.Writer
 	err error
@@ -59,29 +56,27 @@ func (ew *errWriter) println(a ...any) {
 	}
 }
 
-// printLookupResult prints a single lookup result in the configured format.
-// hashes is non-nil for file input (shows all three) and nil for raw hash input.
-func printLookupResult(w io.Writer, path, hash, output, algo string, result VirusTotalResult, hashes *hashResult, meta *fileMeta) error {
-	switch output {
+// PrintLookupResult prints a single lookup result in the configured format.
+func PrintLookupResult(w io.Writer, path, hash, format, algo string, result vtclient.Result, hashes *hasher.Result, meta *fileinfo.Meta) error {
+	switch format {
 	case "json":
-		return printJSON(w, path, hash, algo, result, hashes, meta)
+		return PrintJSON(w, path, hash, algo, result, hashes, meta)
 	default:
-		return printResult(w, hash, algo, result, hashes, meta)
+		return PrintResult(w, hash, algo, result, hashes, meta)
 	}
 }
 
-// printJSON emits a single NDJSON line for one file result.
-// hashes is non-nil for file input, nil for raw hash input.
-func printJSON(w io.Writer, path, hash, algo string, vtResult VirusTotalResult, hashes *hashResult, meta *fileMeta) error {
-	rec := jsonRecord{
+// PrintJSON emits a single NDJSON line for one file result.
+func PrintJSON(w io.Writer, path, hash, algo string, vtResult vtclient.Result, hashes *hasher.Result, meta *fileinfo.Meta) error {
+	rec := JSONRecord{
 		Path:       path,
-		File:       toJSONFileMeta(meta),
+		File:       fileinfo.ToJSON(meta),
 		LookupHash: hash,
 		LookupAlgo: algo,
 		Result:     vtResult,
 	}
 	if hashes != nil {
-		rec.Hashes = jsonHashes{
+		rec.Hashes = JSONHashes{
 			SHA256: hashes.SHA256,
 			SHA1:   hashes.SHA1,
 			MD5:    hashes.MD5,
@@ -90,11 +85,11 @@ func printJSON(w io.Writer, path, hash, algo string, vtResult VirusTotalResult, 
 	} else {
 		switch algo {
 		case "sha256":
-			rec.Hashes = jsonHashes{SHA256: hash}
+			rec.Hashes = JSONHashes{SHA256: hash}
 		case "sha1":
-			rec.Hashes = jsonHashes{SHA1: hash}
+			rec.Hashes = JSONHashes{SHA1: hash}
 		case "md5":
-			rec.Hashes = jsonHashes{MD5: hash}
+			rec.Hashes = JSONHashes{MD5: hash}
 		}
 	}
 	b, err := json.Marshal(rec)
@@ -105,9 +100,9 @@ func printJSON(w io.Writer, path, hash, algo string, vtResult VirusTotalResult, 
 	return err
 }
 
-func printJSONSummary(w io.Writer, path string, scanned, found, malicious int) error {
-	rec := jsonSummaryRecord{
-		Summary: jsonSummary{
+func PrintJSONSummary(w io.Writer, path string, scanned, found, malicious int) error {
+	rec := JSONSummaryRecord{
+		Summary: JSONSummary{
 			Path:      path,
 			Scanned:   scanned,
 			Found:     found,
@@ -122,10 +117,8 @@ func printJSONSummary(w io.Writer, path string, scanned, found, malicious int) e
 	return err
 }
 
-// printResult renders a color-coded summary. When hashes is non-nil (file
-// input), all three hash lines are shown with a * marking the VT lookup hash.
-// When nil (raw hash input), a single hash line is printed.
-func printResult(w io.Writer, hash, algo string, vtResult VirusTotalResult, hashes *hashResult, meta *fileMeta) error {
+// PrintResult renders a color-coded summary.
+func PrintResult(w io.Writer, hash, algo string, vtResult vtclient.Result, hashes *hasher.Result, meta *fileinfo.Meta) error {
 	ew := &errWriter{w: w}
 
 	if meta != nil {
@@ -181,7 +174,6 @@ func printResult(w io.Writer, hash, algo string, vtResult VirusTotalResult, hash
 	return ew.err
 }
 
-// printHashLine prints one hash line. The VT lookup hash is marked with *.
 func printHashLine(ew *errWriter, label, hash string, isVTLookup bool) {
 	prefix := "  "
 	if isVTLookup {
@@ -202,8 +194,6 @@ func algoLabel(algo string) string {
 		return algo
 	}
 }
-
-// Color helpers: green=safe, yellow=noteworthy, red=bad.
 
 func repColorInt(n int) string {
 	if n < 0 {

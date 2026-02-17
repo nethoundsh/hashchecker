@@ -3,13 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
-	"crypto/sha1"
-	"crypto/sha256"
-	"encoding/hex"
 	"flag"
 	"fmt"
-	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,441 +12,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"testing/fstest"
 	"time"
+
+	runnerpkg "github.com/nethoundsh/hashchecker/internal/runner"
+	filterpkg "github.com/nethoundsh/hashchecker/pkg/filter"
+	"github.com/nethoundsh/hashchecker/pkg/vtclient"
 )
-
-func TestIsHexHash(t *testing.T) {
-	const emptySHA256Lower = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	const emptySHA256Upper = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
-	const emptySHA1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
-	const emptyMD5 = "d41d8cd98f00b204e9800998ecf8427e"
-
-	tests := []struct {
-		name     string
-		in       string
-		wantOK   bool
-		wantAlgo string
-	}{
-		{
-			name:     "valid lowercase sha256",
-			in:       emptySHA256Lower,
-			wantOK:   true,
-			wantAlgo: "sha256",
-		},
-		{
-			name:     "valid uppercase sha256",
-			in:       emptySHA256Upper,
-			wantOK:   true,
-			wantAlgo: "sha256",
-		},
-		{
-			name:   "too short",
-			in:     "abc123",
-			wantOK: false,
-		},
-		{
-			name:   "sha256 too long",
-			in:     emptySHA256Lower + "0",
-			wantOK: false,
-		},
-		{
-			name:   "non-hex characters",
-			in:     "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
-			wantOK: false,
-		},
-		{
-			name:   "empty string",
-			in:     "",
-			wantOK: false,
-		},
-		{
-			name:     "valid sha1",
-			in:       emptySHA1,
-			wantOK:   true,
-			wantAlgo: "sha1",
-		},
-		{
-			name:     "valid md5",
-			in:       emptyMD5,
-			wantOK:   true,
-			wantAlgo: "md5",
-		},
-		{
-			name:   "unknown length",
-			in:     "aabbccdd",
-			wantOK: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotOK, gotAlgo := isHexHash(tt.in)
-			if gotOK != tt.wantOK || gotAlgo != tt.wantAlgo {
-				t.Fatalf("isHexHash(%q) = (%v, %q), want (%v, %q)",
-					tt.in, gotOK, gotAlgo, tt.wantOK, tt.wantAlgo)
-			}
-		})
-	}
-}
-
-func TestHashFile(t *testing.T) {
-	content := []byte("hashchecker test content")
-
-	t.Run("all three hashes", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "testfile")
-		if err := os.WriteFile(path, content, 0o644); err != nil {
-			t.Fatalf("writing temp file: %v", err)
-		}
-		sum256 := sha256.Sum256(content)
-		sum1 := sha1.Sum(content)
-		sumMD5 := md5.Sum(content)
-
-		got, err := hashFile(path)
-		if err != nil {
-			t.Fatalf("hashFile() error: %v", err)
-		}
-		if want := hex.EncodeToString(sum256[:]); got.SHA256 != want {
-			t.Fatalf("SHA256 = %q, want %q", got.SHA256, want)
-		}
-		if want := hex.EncodeToString(sum1[:]); got.SHA1 != want {
-			t.Fatalf("SHA1 = %q, want %q", got.SHA1, want)
-		}
-		if want := hex.EncodeToString(sumMD5[:]); got.MD5 != want {
-			t.Fatalf("MD5 = %q, want %q", got.MD5, want)
-		}
-		if got.TLSH != "" {
-			t.Fatalf("TLSH = %q, want empty for small file", got.TLSH)
-		}
-	})
-
-	t.Run("empty file", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "empty")
-		if err := os.WriteFile(path, []byte{}, 0o644); err != nil {
-			t.Fatalf("writing temp file: %v", err)
-		}
-		sum256 := sha256.Sum256([]byte{})
-		got, err := hashFile(path)
-		if err != nil {
-			t.Fatalf("hashFile() error: %v", err)
-		}
-		if want := hex.EncodeToString(sum256[:]); got.SHA256 != want {
-			t.Fatalf("SHA256 = %q, want %q", got.SHA256, want)
-		}
-		if got.TLSH != "" {
-			t.Fatalf("TLSH = %q, want empty for empty file", got.TLSH)
-		}
-	})
-
-	t.Run("large file includes tlsh", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "large")
-		data := make([]byte, 1024)
-		for i := range data {
-			data[i] = byte(i % 251)
-		}
-		if err := os.WriteFile(path, data, 0o644); err != nil {
-			t.Fatalf("writing temp file: %v", err)
-		}
-		got, err := hashFile(path)
-		if err != nil {
-			t.Fatalf("hashFile() error: %v", err)
-		}
-		if got.TLSH == "" {
-			t.Fatal("TLSH should be non-empty for large varied file")
-		}
-	})
-
-	t.Run("nonexistent file", func(t *testing.T) {
-		_, err := hashFile(filepath.Join(t.TempDir(), "does-not-exist"))
-		if err == nil {
-			t.Fatal("hashFile() should return error for nonexistent file")
-		}
-	})
-}
-
-func TestNewFileMeta(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "meta.txt")
-	if err := os.WriteFile(path, []byte("metadata test content"), 0o640); err != nil {
-		t.Fatalf("writing temp file: %v", err)
-	}
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat temp file: %v", err)
-	}
-
-	meta := newFileMeta(path, fi)
-	if meta == nil {
-		t.Fatal("newFileMeta returned nil")
-	}
-	if meta.Name != fi.Name() {
-		t.Fatalf("Name = %q, want %q", meta.Name, fi.Name())
-	}
-	if meta.Size != fi.Size() {
-		t.Fatalf("Size = %d, want %d", meta.Size, fi.Size())
-	}
-	if meta.SizeHuman == "" {
-		t.Fatal("SizeHuman should not be empty")
-	}
-	if meta.Modified.IsZero() {
-		t.Fatal("Modified should not be zero")
-	}
-	if meta.Permissions != fi.Mode().String() {
-		t.Fatalf("Permissions = %q, want %q", meta.Permissions, fi.Mode().String())
-	}
-	if !meta.Created.IsZero() && meta.Created.Location() != time.UTC {
-		t.Fatalf("Created should be UTC when present, got %v", meta.Created.Location())
-	}
-}
-
-func TestTruncateRunes(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		max  int
-		want string
-	}{
-		{
-			name: "shorter than max",
-			in:   "hello",
-			max:  10,
-			want: "hello",
-		},
-		{
-			name: "exactly max",
-			in:   "hello",
-			max:  5,
-			want: "hello",
-		},
-		{
-			name: "longer than max",
-			in:   "hello world",
-			max:  5,
-			want: "hello...",
-		},
-		{
-			name: "empty string with positive max",
-			in:   "",
-			max:  5,
-			want: "",
-		},
-		{
-			name: "max zero",
-			in:   "hello",
-			max:  0,
-			want: "",
-		},
-		{
-			name: "max negative",
-			in:   "hello",
-			max:  -1,
-			want: "",
-		},
-		{
-			name: "multi-byte runes truncate cleanly",
-			in:   "héllo",
-			max:  3,
-			want: "hél...",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := truncateRunes(tt.in, tt.max); got != tt.want {
-				t.Fatalf("truncateRunes(%q, %d) = %q, want %q", tt.in, tt.max, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestParseRetryAfter(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want time.Duration
-	}{
-		{
-			name: "empty string default",
-			in:   "",
-			want: 60 * time.Second,
-		},
-		{
-			name: "integer thirty",
-			in:   "30",
-			want: 30 * time.Second,
-		},
-		{
-			name: "integer one",
-			in:   "1",
-			want: 1 * time.Second,
-		},
-		{
-			name: "zero falls back to default",
-			in:   "0",
-			want: 60 * time.Second,
-		},
-		{
-			name: "negative falls back to default",
-			in:   "-5",
-			want: 60 * time.Second,
-		},
-		{
-			name: "non-numeric garbage",
-			in:   "not-a-number",
-			want: 60 * time.Second,
-		},
-		{
-			name: "RFC1123 date in the future",
-			in:   time.Now().Add(30 * time.Second).UTC().Format(time.RFC1123),
-			want: 30 * time.Second,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := parseRetryAfter(tt.in)
-			// RFC1123 dates produce an approximate duration (time.Until is
-			// evaluated at call time), so we allow ±2s tolerance for that case.
-			if tt.name == "RFC1123 date in the future" {
-				diff := got - tt.want
-				if diff < 0 {
-					diff = -diff
-				}
-				if diff > 2*time.Second {
-					t.Fatalf("parseRetryAfter(%q) = %v, want ~%v (±2s)", tt.in, got, tt.want)
-				}
-				return
-			}
-			if got != tt.want {
-				t.Fatalf("parseRetryAfter(%q) = %v, want %v", tt.in, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestShouldProcess(t *testing.T) {
-	type args struct {
-		name     string
-		size     int
-		includes []string
-		excludes []string
-		minSize  int64
-		maxSize  int64
-	}
-
-	tests := []struct {
-		name string
-		args args
-		want bool
-	}{
-		{
-			name: "no filters",
-			args: args{
-				name: "test.exe",
-				size: 1024,
-			},
-			want: true,
-		},
-		{
-			name: "include exe matches",
-			args: args{
-				name:     "test.exe",
-				size:     1024,
-				includes: []string{"*.exe"},
-			},
-			want: true,
-		},
-		{
-			name: "include exe does not match txt",
-			args: args{
-				name:     "test.txt",
-				size:     1024,
-				includes: []string{"*.exe"},
-			},
-			want: false,
-		},
-		{
-			name: "exclude log matches",
-			args: args{
-				name:     "test.log",
-				size:     1024,
-				excludes: []string{"*.log"},
-			},
-			want: false,
-		},
-		{
-			name: "exclude log does not match exe",
-			args: args{
-				name:     "test.exe",
-				size:     1024,
-				excludes: []string{"*.log"},
-			},
-			want: true,
-		},
-		{
-			name: "include and exclude same pattern",
-			args: args{
-				name:     "test.exe",
-				size:     1024,
-				includes: []string{"*.exe"},
-				excludes: []string{"*.exe"},
-			},
-			want: false,
-		},
-		{
-			name: "minSize larger than file",
-			args: args{
-				name:    "test.exe",
-				size:    1024,
-				minSize: 2048,
-			},
-			want: false,
-		},
-		{
-			name: "maxSize smaller than file",
-			args: args{
-				name:    "test.exe",
-				size:    1024,
-				maxSize: 512,
-			},
-			want: false,
-		},
-		{
-			name: "size within min and max",
-			args: args{
-				name:    "test.exe",
-				size:    1024,
-				minSize: 512,
-				maxSize: 2048,
-			},
-			want: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Build a MapFS with a single file of the requested size.
-			fsys := fstest.MapFS{
-				tt.args.name: &fstest.MapFile{Data: make([]byte, tt.args.size)},
-			}
-			entries, err := fs.ReadDir(fsys, ".")
-			if err != nil {
-				t.Fatalf("ReadDir error: %v", err)
-			}
-			if len(entries) != 1 {
-				t.Fatalf("expected 1 entry, got %d", len(entries))
-			}
-			d := entries[0]
-
-			got, err := shouldProcess(d, tt.args.includes, tt.args.excludes, tt.args.minSize, tt.args.maxSize)
-			if err != nil {
-				t.Fatalf("shouldProcess returned unexpected error: %v", err)
-			}
-			if got != tt.want {
-				t.Fatalf("shouldProcess() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
 
 // callRun resets the global flag state, sets os.Args, and calls run().
 // This lets us test run()'s early validation paths without making real
@@ -608,6 +174,15 @@ func TestRunNoCacheFlag(t *testing.T) {
 
 // startMockVT creates a mock VirusTotal server and sets up the env vars
 // for run() to use it. Returns the server (caller must defer srv.Close()).
+func setTestBaseURL(t *testing.T, url string) {
+	t.Helper()
+	old := testBaseURL
+	testBaseURL = url
+	t.Cleanup(func() {
+		testBaseURL = old
+	})
+}
+
 func startMockVT(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -615,7 +190,7 @@ func startMockVT(t *testing.T) *httptest.Server {
 		_, _ = fmt.Fprint(w, vtJSON("test.exe", 0, 0, 0, 5, 60, ""))
 	}))
 	t.Setenv("VIRUSTOTAL_API_KEY", "test-key")
-	t.Setenv("VIRUSTOTAL_BASE_URL", srv.URL+"/")
+	setTestBaseURL(t, srv.URL+"/")
 	return srv
 }
 
@@ -643,7 +218,7 @@ func TestRunHashLookupMalicious(t *testing.T) {
 	defer srv.Close()
 
 	t.Setenv("VIRUSTOTAL_API_KEY", "test-key")
-	t.Setenv("VIRUSTOTAL_BASE_URL", srv.URL+"/")
+	setTestBaseURL(t, srv.URL+"/")
 
 	hash := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	code, _ := callRun(t, "-no-cache", hash)
@@ -700,6 +275,57 @@ func TestRunSingleFile(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "test.exe") {
 		t.Fatalf("output should contain VT result name, got %q", stdout)
+	}
+}
+
+func TestRunSingleFileJSON(t *testing.T) {
+	srv := startMockVT(t)
+	defer srv.Close()
+
+	tmpFile := filepath.Join(t.TempDir(), "testfile.txt")
+	if err := os.WriteFile(tmpFile, []byte("hello world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout := callRun(t, "-no-cache", "-o", "json", tmpFile)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, `"path":"`+tmpFile+`"`) {
+		t.Fatalf("expected JSON output to include file path, got %q", stdout)
+	}
+	if !strings.Contains(stdout, `"lookup_algorithm":"sha256"`) {
+		t.Fatalf("expected JSON output to include sha256 lookup algorithm, got %q", stdout)
+	}
+}
+
+func TestRunHashNamedFilePrefersFileMode(t *testing.T) {
+	srv := startMockVT(t)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	defer func() { _ = os.Chdir(oldWD) }()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir temp dir: %v", err)
+	}
+
+	const hashNamedFile = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if err := os.WriteFile(hashNamedFile, []byte("hello world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout := callRun(t, "-no-cache", hashNamedFile)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	// SHA-256 of "hello world"; if hash mode were chosen, the lookup hash
+	// would instead be the filename value above.
+	if !strings.Contains(stdout, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9") {
+		t.Fatalf("expected file-mode lookup hash in output, got %q", stdout)
 	}
 }
 
@@ -859,7 +485,7 @@ func TestRunHashListMode(t *testing.T) {
 		}))
 		defer srv.Close()
 		t.Setenv("VIRUSTOTAL_API_KEY", "test-key")
-		t.Setenv("VIRUSTOTAL_BASE_URL", srv.URL+"/")
+		setTestBaseURL(t, srv.URL+"/")
 
 		hashList := writeHashList(t,
 			"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -1044,7 +670,7 @@ func TestRunDirectoryConcurrentMalicious(t *testing.T) {
 	defer srv.Close()
 
 	t.Setenv("VIRUSTOTAL_API_KEY", "test-key")
-	t.Setenv("VIRUSTOTAL_BASE_URL", srv.URL+"/")
+	setTestBaseURL(t, srv.URL+"/")
 
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("aaa"), 0o644); err != nil {
@@ -1118,21 +744,21 @@ func TestRunConcurrentInterrupt(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	cfg := lookupConfig{
-		vt: vtClient{
-			ctx:    ctx,
-			client: &http.Client{Timeout: 1 * time.Second},
+	cfg := vtclient.LookupConfig{
+		VT: vtclient.Client{
+			Ctx:        ctx,
+			HTTPClient: &http.Client{Timeout: 1 * time.Second},
 		},
-		cache: cacheConfig{
-			entries:    make(map[string]cacheEntry),
-			mu:         &sync.Mutex{},
-			maxAgeDays: 7,
+		Cache: vtclient.CacheConfig{
+			Entries:    make(map[string]vtclient.CacheEntry),
+			Mu:         &sync.Mutex{},
+			MaxAgeDays: 7,
 		},
-		output: "text",
-		algo:   "sha256",
+		Output: "text",
+		Algo:   "sha256",
 	}
 
-	code := runDir(dir, cfg, scanConfig{}, false, 4)
+	code := runnerpkg.RunDir(dir, cfg, filterpkg.Config{}, false, 4)
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1 for interrupted run", code)
 	}

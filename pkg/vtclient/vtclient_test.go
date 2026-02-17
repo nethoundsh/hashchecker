@@ -1,4 +1,4 @@
-package main
+package vtclient
 
 import (
 	"context"
@@ -14,9 +14,6 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// vtJSON returns a valid VirusTotal API v3 JSON response body with
-// the given analysis stats. This avoids duplicating the nested JSON
-// structure in every test case.
 func vtJSON(name string, reputation, malicious, suspicious, undetected, harmless int, threatLabel string) string {
 	return fmt.Sprintf(`{
 		"data": {
@@ -37,14 +34,95 @@ func vtJSON(name string, reputation, malicious, suspicious, undetected, harmless
 	}`, name, reputation, malicious, suspicious, undetected, harmless, threatLabel)
 }
 
+func TestTruncateRunes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		max  int
+		want string
+	}{
+		{name: "shorter than max", in: "hello", max: 10, want: "hello"},
+		{name: "exactly max", in: "hello", max: 5, want: "hello"},
+		{name: "longer than max", in: "hello world", max: 5, want: "hello..."},
+		{name: "empty string with positive max", in: "", max: 5, want: ""},
+		{name: "max zero", in: "hello", max: 0, want: ""},
+		{name: "max negative", in: "hello", max: -1, want: ""},
+		{name: "multi-byte runes truncate cleanly", in: "héllo", max: 3, want: "hél..."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := truncateRunes(tt.in, tt.max); got != tt.want {
+				t.Fatalf("truncateRunes(%q, %d) = %q, want %q", tt.in, tt.max, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want time.Duration
+	}{
+		{name: "empty string default", in: "", want: 60 * time.Second},
+		{name: "integer thirty", in: "30", want: 30 * time.Second},
+		{name: "integer one", in: "1", want: 1 * time.Second},
+		{name: "zero falls back to default", in: "0", want: 60 * time.Second},
+		{name: "negative falls back to default", in: "-5", want: 60 * time.Second},
+		{name: "non-numeric garbage", in: "not-a-number", want: 60 * time.Second},
+		{name: "RFC1123 date in the future", in: time.Now().Add(30 * time.Second).UTC().Format(time.RFC1123), want: 30 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseRetryAfter(tt.in)
+			if tt.name == "RFC1123 date in the future" {
+				diff := got - tt.want
+				if diff < 0 {
+					diff = -diff
+				}
+				if diff > 2*time.Second {
+					t.Fatalf("parseRetryAfter(%q) = %v, want ~%v (±2s)", tt.in, got, tt.want)
+				}
+				return
+			}
+			if got != tt.want {
+				t.Fatalf("parseRetryAfter(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMigrateLegacyCacheKeys(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	cache := map[string]CacheEntry{
+		"abc123": {
+			Result:    Result{Found: true, Name: "legacy.exe", Malicious: 1},
+			Timestamp: now,
+		},
+		"sha256:def456": {
+			Result:    Result{Found: true, Name: "already-migrated.exe"},
+			Timestamp: now,
+		},
+	}
+	MigrateLegacyCacheKeys(cache)
+
+	if _, ok := cache["abc123"]; ok {
+		t.Fatal("bare key 'abc123' should have been migrated")
+	}
+	if _, ok := cache["sha256:abc123"]; !ok {
+		t.Fatal("expected migrated key 'sha256:abc123'")
+	}
+	if cache["sha256:abc123"].Result.Name != "legacy.exe" {
+		t.Fatalf("migrated entry Name = %q, want %q", cache["sha256:abc123"].Result.Name, "legacy.exe")
+	}
+	if _, ok := cache["sha256:def456"]; !ok {
+		t.Fatal("expected key 'sha256:def456' to remain")
+	}
+}
+
 func TestCheckVirusTotal(t *testing.T) {
-	// Go idiom: httptest.NewServer creates a real HTTP server on localhost.
-	// It's the standard way to test HTTP clients in Go without mocking
-	// interfaces. The server's .URL field gives you the base URL to pass
-	// to your client code.
-
 	const testHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
 	tests := []struct {
 		name      string
 		handler   http.HandlerFunc
@@ -135,37 +213,27 @@ func TestCheckVirusTotal(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := httptest.NewServer(tt.handler)
 			defer srv.Close()
-
 			ctx := context.Background()
-			var cancel context.CancelFunc
 			if tt.cancelCtx {
+				var cancel context.CancelFunc
 				ctx, cancel = context.WithCancel(ctx)
-				cancel() // cancel immediately
+				cancel()
 			}
-			_ = cancel // avoid unused variable if not cancelCtx
-
 			client := srv.Client()
 			client.Timeout = 3 * time.Second
 
 			result, err := checkVirusTotal(ctx, client, "test-api-key", testHash, srv.URL+"/")
-
 			if tt.wantErr != "" {
-				if err == nil {
-					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
-				}
-				if !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("error %q does not contain %q", err.Error(), tt.wantErr)
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error %v does not contain %q", err, tt.wantErr)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if result.Found != tt.wantFound {
-				t.Fatalf("Found = %v, want %v", result.Found, tt.wantFound)
-			}
-			if result.Malicious != tt.wantMal {
-				t.Fatalf("Malicious = %d, want %d", result.Malicious, tt.wantMal)
+			if result.Found != tt.wantFound || result.Malicious != tt.wantMal {
+				t.Fatalf("got result %+v, want Found=%v Malicious=%d", result, tt.wantFound, tt.wantMal)
 			}
 		})
 	}
@@ -187,27 +255,19 @@ func TestCheckVirusTotalSendsAPIKey(t *testing.T) {
 
 func TestLookup(t *testing.T) {
 	const testHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
 	tests := []struct {
 		name         string
-		cache        map[string]cacheEntry
+		cache        map[string]CacheEntry
 		refresh      bool
 		wantAPICalls int32
 		wantFound    bool
 	}{
-		{
-			name:         "cache miss calls API",
-			cache:        make(map[string]cacheEntry),
-			wantAPICalls: 1,
-			wantFound:    true,
-		},
+		{name: "cache miss calls API", cache: make(map[string]CacheEntry), wantAPICalls: 1, wantFound: true},
 		{
 			name: "cache hit skips API",
-			cache: map[string]cacheEntry{
+			cache: map[string]CacheEntry{
 				"sha256:" + testHash: {
-					Result: VirusTotalResult{
-						Found: true, Name: "from-cache.exe", Malicious: 3,
-					},
+					Result:    Result{Found: true, Name: "from-cache.exe", Malicious: 3},
 					Timestamp: time.Now(),
 				},
 			},
@@ -216,11 +276,9 @@ func TestLookup(t *testing.T) {
 		},
 		{
 			name: "expired cache calls API",
-			cache: map[string]cacheEntry{
+			cache: map[string]CacheEntry{
 				"sha256:" + testHash: {
-					Result: VirusTotalResult{
-						Found: true, Name: "old-cache.exe",
-					},
+					Result:    Result{Found: true, Name: "old-cache.exe"},
 					Timestamp: time.Now().Add(-30 * 24 * time.Hour),
 				},
 			},
@@ -229,9 +287,9 @@ func TestLookup(t *testing.T) {
 		},
 		{
 			name: "refresh bypasses cache",
-			cache: map[string]cacheEntry{
+			cache: map[string]CacheEntry{
 				"sha256:" + testHash: {
-					Result:    VirusTotalResult{Found: true, Name: "cached.exe"},
+					Result:    Result{Found: true, Name: "cached.exe"},
 					Timestamp: time.Now(),
 				},
 			},
@@ -251,25 +309,25 @@ func TestLookup(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			cfg := lookupConfig{
-				vt: vtClient{
-					ctx:     context.Background(),
-					client:  srv.Client(),
-					apiKey:  "test-key",
-					baseURL: srv.URL + "/",
-					limiter: nil,
+			cfg := LookupConfig{
+				VT: Client{
+					Ctx:        context.Background(),
+					HTTPClient: srv.Client(),
+					APIKey:     "test-key",
+					BaseURL:    srv.URL + "/",
+					Limiter:    nil,
 				},
-				cache: cacheConfig{
-					entries:    tt.cache,
-					mu:         &sync.Mutex{},
-					refresh:    tt.refresh,
-					maxAgeDays: 7,
+				Cache: CacheConfig{
+					Entries:    tt.cache,
+					Mu:         &sync.Mutex{},
+					Refresh:    tt.refresh,
+					MaxAgeDays: 7,
 				},
-				output: "text",
-				algo:   "sha256",
+				Output: "text",
+				Algo:   "sha256",
 			}
 
-			result, err := lookup(testHash, cfg)
+			result, err := Lookup(testHash, cfg)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -285,32 +343,24 @@ func TestLookup(t *testing.T) {
 
 func TestWaitForRateLimit(t *testing.T) {
 	t.Run("nil limiter returns immediately", func(t *testing.T) {
-		err := waitForRateLimit(context.Background(), nil)
-		if err != nil {
+		if err := waitForRateLimit(context.Background(), nil); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 
 	t.Run("fast limiter succeeds", func(t *testing.T) {
-		// 1000 req/min = basically instant
 		limiter := rate.NewLimiter(rate.Every(time.Minute/1000), 1)
-		err := waitForRateLimit(context.Background(), limiter)
-		if err != nil {
+		if err := waitForRateLimit(context.Background(), limiter); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 
 	t.Run("cancelled context returns error", func(t *testing.T) {
-		// Slow limiter that will block — combined with cancelled context
 		limiter := rate.NewLimiter(rate.Every(time.Hour), 1)
-		// Drain the single burst token
 		_ = limiter.Wait(context.Background())
-
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-
-		err := waitForRateLimit(ctx, limiter)
-		if err == nil {
+		if err := waitForRateLimit(ctx, limiter); err == nil {
 			t.Fatal("expected error for cancelled context, got nil")
 		}
 	})

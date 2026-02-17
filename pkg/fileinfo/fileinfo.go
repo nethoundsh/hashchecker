@@ -1,4 +1,4 @@
-package main
+package fileinfo
 
 import (
 	"os"
@@ -7,7 +7,7 @@ import (
 	"github.com/dustin/go-humanize"
 )
 
-type fileMeta struct {
+type Meta struct {
 	Name        string
 	Size        int64
 	SizeHuman   string
@@ -16,7 +16,7 @@ type fileMeta struct {
 	Permissions string
 }
 
-type jsonFileMeta struct {
+type JSONMeta struct {
 	Name        string `json:"name"`
 	Size        int64  `json:"size"`
 	SizeHuman   string `json:"size_human"`
@@ -25,8 +25,8 @@ type jsonFileMeta struct {
 	Permissions string `json:"permissions"`
 }
 
-func newFileMeta(path string, fi os.FileInfo) *fileMeta {
-	return &fileMeta{
+func New(path string, fi os.FileInfo) *Meta {
+	return &Meta{
 		Name:        fi.Name(),
 		Size:        fi.Size(),
 		SizeHuman:   humanize.Bytes(uint64(fi.Size())),
@@ -36,11 +36,11 @@ func newFileMeta(path string, fi os.FileInfo) *fileMeta {
 	}
 }
 
-func toJSONFileMeta(meta *fileMeta) *jsonFileMeta {
+func ToJSON(meta *Meta) *JSONMeta {
 	if meta == nil {
 		return nil
 	}
-	out := &jsonFileMeta{
+	out := &JSONMeta{
 		Name:        meta.Name,
 		Size:        meta.Size,
 		SizeHuman:   meta.SizeHuman,
